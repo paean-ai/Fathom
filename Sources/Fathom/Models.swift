@@ -28,12 +28,29 @@ public struct ToolCall: Sendable, Equatable, Codable {
     }
 }
 
-/// A single assistant completion (text and/or tool calls).
+/// Token usage for a completion or a whole run.
+public struct Usage: Sendable, Equatable {
+    public var promptTokens: Int
+    public var completionTokens: Int
+    public var totalTokens: Int
+    public init(prompt: Int = 0, completion: Int = 0, total: Int? = nil) {
+        promptTokens = prompt; completionTokens = completion
+        totalTokens = total ?? (prompt + completion)
+    }
+    public static func + (a: Usage, b: Usage) -> Usage {
+        Usage(prompt: a.promptTokens + b.promptTokens,
+              completion: a.completionTokens + b.completionTokens,
+              total: a.totalTokens + b.totalTokens)
+    }
+}
+
+/// A single assistant completion (text and/or tool calls), with optional usage.
 public struct Completion: Sendable, Equatable {
     public let content: String?
     public let toolCalls: [ToolCall]
-    public init(content: String?, toolCalls: [ToolCall] = []) {
-        self.content = content; self.toolCalls = toolCalls
+    public let usage: Usage?
+    public init(content: String?, toolCalls: [ToolCall] = [], usage: Usage? = nil) {
+        self.content = content; self.toolCalls = toolCalls; self.usage = usage
     }
     public var wantsTools: Bool { !toolCalls.isEmpty }
 }
@@ -43,6 +60,8 @@ public enum FinishReason: Equatable, Sendable {
     case natural        // the model stopped requesting tools
     case roundLimit     // ran out of rounds
     case noProgress     // two rounds added nothing new
+    case budget         // the token budget was reached
+    case cancelled      // the task was cancelled
 }
 
 /// The result of an orchestrated run.
@@ -55,10 +74,13 @@ public struct RunResult: Sendable {
     public let plan: [String]
     /// True when the critic flagged the first answer and it was revised.
     public let revised: Bool
+    /// Cumulative token usage across every model call in the run.
+    public let usage: Usage
     public init(answer: String, messages: [ChatMessage], toolCallCount: Int,
-                finish: FinishReason, plan: [String] = [], revised: Bool = false) {
+                finish: FinishReason, plan: [String] = [], revised: Bool = false,
+                usage: Usage = Usage()) {
         self.answer = answer; self.messages = messages; self.toolCallCount = toolCallCount
-        self.finish = finish; self.plan = plan; self.revised = revised
+        self.finish = finish; self.plan = plan; self.revised = revised; self.usage = usage
     }
 }
 

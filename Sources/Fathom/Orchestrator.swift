@@ -29,15 +29,19 @@ public struct Orchestrator: Sendable {
     /// VERIFY phase: when true, a critic reviews the draft answer and the agent revises
     /// once if it falls short (reflection). Off by default.
     public var critic: Bool
+    /// Optional cap on total tokens for the run. Once cumulative usage reaches it, the
+    /// loop stops requesting tools and produces a final answer (finish = `.budget`). nil =
+    /// unbounded. Requires the client to report usage.
+    public var tokenBudget: Int?
 
     public init(client: LLMClient, maxRounds: Int = 8,
                 onStatus: @escaping @Sendable (String) -> Void = { _ in },
                 onObservation: @escaping @Sendable (Observation) -> Void = { _ in },
                 approval: @escaping @Sendable (ToolCall) async -> ToolApproval = { _ in .allow },
-                planning: Bool = false, critic: Bool = false) {
+                planning: Bool = false, critic: Bool = false, tokenBudget: Int? = nil) {
         self.client = client; self.maxRounds = maxRounds
         self.onStatus = onStatus; self.onObservation = onObservation; self.approval = approval
-        self.planning = planning; self.critic = critic
+        self.planning = planning; self.critic = critic; self.tokenBudget = tokenBudget
     }
 
     /// One tool call and its outcome, reported to `onObservation`.
@@ -64,11 +68,15 @@ public struct Orchestrator: Sendable {
         convo += history.filter { $0.role == .user || $0.role == .assistant || $0.role == .system }
         convo.append(ChatMessage(role: .user, content: query))
 
+        var usage = Usage()                       // cumulative across every model call
+
         // PLAN phase — decompose the goal first, then let the loop work the steps.
         var plan: [String] = []
         if planning {
             onStatus("Planning…")
-            plan = try await makePlan(query: query)
+            let (steps, u) = try await makePlan(query: query)
+            usage = usage + u
+            plan = steps
             if !plan.isEmpty {
                 let numbered = plan.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
                 convo.append(ChatMessage(role: .system,
@@ -83,7 +91,12 @@ public struct Orchestrator: Sendable {
         var naturalAnswer: String?   // set when the model answers in-loop (no tools)
 
         for _ in 0..<maxRounds {
+            // Stop gracefully on cancellation or when the token budget is reached.
+            if Task.isCancelled { finish = .cancelled; break }
+            if let budget = tokenBudget, usage.totalTokens >= budget { finish = .budget; break }
+
             let completion = try await client.complete(messages: convo, tools: schemas)
+            usage = usage + (completion.usage ?? Usage())
             guard completion.wantsTools else {
                 naturalAnswer = completion.content ?? ""
                 finish = .natural
@@ -161,52 +174,60 @@ public struct Orchestrator: Sendable {
         }
 
         // If the model already answered in-loop (no tools), that text IS the answer.
-        // Otherwise (round/no-progress cap) ask once more, tool-free, for a closing answer.
+        // On cancellation, return the best we have without spending more tokens.
+        // Otherwise (round/no-progress/budget cap) ask once more, tool-free, to close out.
         var answer: String
-        if let naturalAnswer {
+        if finish == .cancelled {
+            answer = naturalAnswer ?? ""
+        } else if let naturalAnswer {
             answer = naturalAnswer
         } else {
             let final = try await client.complete(messages: convo, tools: [])
+            usage = usage + (final.usage ?? Usage())
             answer = final.content ?? ""
         }
 
         // VERIFY phase — a critic reviews the draft; revise once if it falls short.
+        // Skipped on cancellation.
         var revised = false
-        if critic, !answer.isEmpty {
+        if critic, finish != .cancelled, !answer.isEmpty {
             onStatus("Reviewing…")
-            if case let .revise(feedback) = try await runCritic(query: query, answer: answer) {
+            let (verdict, cu) = try await runCritic(query: query, answer: answer)
+            usage = usage + cu
+            if case let .revise(feedback) = verdict {
                 convo.append(ChatMessage(role: .system,
                     content: "A reviewer flagged the answer: \(feedback)\nRevise it to fully address this. Answer directly."))
                 let redo = try await client.complete(messages: convo, tools: [])
+                usage = usage + (redo.usage ?? Usage())
                 let improved = redo.content ?? ""
                 if !improved.isEmpty { answer = improved; revised = true }
             }
         }
 
         return RunResult(answer: answer, messages: convo, toolCallCount: calls,
-                         finish: finish, plan: plan, revised: revised)
+                         finish: finish, plan: plan, revised: revised, usage: usage)
     }
 
     // MARK: plan & verify phases
 
-    /// Ask the model to decompose the goal into a short ordered list of steps.
-    private func makePlan(query: String) async throws -> [String] {
+    /// Ask the model to decompose the goal into steps (returns steps + token usage).
+    private func makePlan(query: String) async throws -> (steps: [String], usage: Usage) {
         let msgs = [
             ChatMessage(role: .system, content: "You are a planner. Break the user's request into 2–6 short imperative steps. Reply with a numbered list and nothing else. If the request is trivial, reply with a single step."),
             ChatMessage(role: .user, content: query),
         ]
         let c = try await client.complete(messages: msgs, tools: [])
-        return Self.parsePlanSteps(c.content ?? "")
+        return (Self.parsePlanSteps(c.content ?? ""), c.usage ?? Usage())
     }
 
-    /// Ask a strict reviewer whether the draft answer is good enough.
-    private func runCritic(query: String, answer: String) async throws -> CriticVerdict {
+    /// Ask a strict reviewer whether the draft answer is good enough (verdict + usage).
+    private func runCritic(query: String, answer: String) async throws -> (verdict: CriticVerdict, usage: Usage) {
         let msgs = [
             ChatMessage(role: .system, content: "You are a strict reviewer. Given the request and the agent's answer, decide if the answer is correct, complete, and grounded. If it is, reply exactly 'PASS'. Otherwise reply 'REVISE: <what is missing or wrong>'."),
             ChatMessage(role: .user, content: "Request: \(query)\n\nAnswer: \(answer)"),
         ]
         let c = try await client.complete(messages: msgs, tools: [])
-        return Self.parseCritic(c.content ?? "")
+        return (Self.parseCritic(c.content ?? ""), c.usage ?? Usage())
     }
 
     /// Parse a model's plan reply into clean steps. Prefers genuine list items (so a
@@ -265,6 +286,8 @@ public struct Orchestrator: Sendable {
         case .natural:    return nil
         case .noProgress: return "Wrapping up — no new information in the last steps."
         case .roundLimit: return "Reached the step limit — answering with what I have."
+        case .budget:     return "Reached the token budget — answering with what I have."
+        case .cancelled:  return "Cancelled — returning what was gathered so far."
         }
     }
 }

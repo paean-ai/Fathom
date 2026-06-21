@@ -54,7 +54,10 @@ public struct DeepSeekClient: LLMClient {
         let decoded = try JSONDecoder().decode(WireResponse.self, from: data)
         let msg = decoded.choices.first?.message
         let calls = (msg?.toolCalls ?? []).map { ToolCall(id: $0.id, name: $0.function.name, arguments: $0.function.arguments) }
-        return Completion(content: msg?.content, toolCalls: calls)
+        let usage = decoded.usage.map {
+            Usage(prompt: $0.promptTokens ?? 0, completion: $0.completionTokens ?? 0, total: $0.totalTokens)
+        }
+        return Completion(content: msg?.content, toolCalls: calls, usage: usage)
     }
 
     /// Convert a ChatMessage to the wire JSON the API expects.
@@ -79,6 +82,13 @@ public struct DeepSeekClient: LLMClient {
         }
         struct Call: Decodable { let id: String; let function: Fn }
         struct Fn: Decodable { let name: String; let arguments: String }
+        struct UsageWire: Decodable {
+            let promptTokens: Int?; let completionTokens: Int?; let totalTokens: Int?
+            enum CodingKeys: String, CodingKey {
+                case promptTokens = "prompt_tokens", completionTokens = "completion_tokens", totalTokens = "total_tokens"
+            }
+        }
         let choices: [Choice]
+        let usage: UsageWire?
     }
 }
