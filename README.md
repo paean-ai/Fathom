@@ -21,6 +21,8 @@ agent needs.
 - **Parallel tool execution** — independent tool calls in one round run concurrently.
 - **Observation hook** — collect side effects (citations, traces) as the loop runs.
 - **Resilience** — wrap any client in `RetryingClient` for retry + backoff on transient failures.
+- **Built-in general tools** — `CalculatorTool` (exact arithmetic) and `CurrentDateTimeTool`,
+  ready to drop into any agent; bring your own for app-specific capabilities.
 
 Fully mockable (inject any `LLMClient`) — the whole thing is testable offline, no network.
 
