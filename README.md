@@ -25,6 +25,7 @@ agent needs.
 - **Resilience** — wrap any client in `RetryingClient` for retry + backoff on transient failures.
 - **Cost control & cancellation** — cumulative token `usage` on every `RunResult`, an optional `tokenBudget` that stops the loop early (finish `.budget`), and cooperative `Task` cancellation (returns best-so-far, finish `.cancelled`).
 - **Output guardrails** — validate the final answer with a host predicate; on failure it auto-regenerates with the reason fed back (bounded by `maxGuardrailRetries`). Enforce JSON-parses, required fields, length, no-PII, etc.
+- **Streaming** — `agent.stream(query)` yields `AgentEvent`s (`.status` / `.toolResult` / `.answerDelta` / `.finished`) so the answer arrives token-by-token; `DeepSeekClient` streams via SSE, and any non-streaming client falls back to a whole-answer yield.
 - **Sub-agents** — wrap any `Agent` as a `SubAgentTool` so a parent agent can delegate a focused sub-task to a specialist (hierarchical / multi-agent workflows).
 - **Built-in general tools** — `CalculatorTool`, `UnitConvertTool`, `CurrentDateTimeTool`, `TranslateTool`, plus `WebSearchTool`/`WebFetchTool` (host supplies a `WebSearchEngine`),
   ready to drop into any agent; bring your own for app-specific capabilities.
@@ -36,7 +37,7 @@ Fully mockable (inject any `LLMClient`) — the whole thing is testable offline,
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/<you>/Fathom.git", from: "0.1.0")
+    .package(url: "https://github.com/<you>/Fathom.git", from: "1.0.0")
 ],
 targets: [
     .target(name: "MyApp", dependencies: ["Fathom"])
