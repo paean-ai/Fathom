@@ -41,6 +41,31 @@ final class BuiltinToolsTests: XCTestCase {
         XCTAssertEqual(fn?["name"] as? String, "calculate")
     }
 
+    // MARK: UnitConvert (pure)
+
+    func testUnitConversions() {
+        XCTAssertEqual(UnitConvert.convert(1, from: "km", to: "m"), 1000)
+        XCTAssertEqual(UnitConvert.convert(1, from: "kg", to: "g"), 1000)
+        XCTAssertEqual(UnitConvert.convert(100, from: "celsius", to: "fahrenheit"), 212)
+        XCTAssertEqual(UnitConvert.convert(0, from: "c", to: "k"), 273.15)
+        // Aliases/plurals canonicalize.
+        XCTAssertEqual(UnitConvert.canonical("miles"), "mi")
+        XCTAssertEqual(UnitConvert.canonical("Kilograms"), "kg")
+    }
+
+    func testUnitConvertRejectsCrossDimensionAndUnknown() {
+        XCTAssertNil(UnitConvert.convert(1, from: "m", to: "kg"), "length → mass is invalid")
+        XCTAssertNil(UnitConvert.convert(1, from: "banana", to: "m"), "unknown unit")
+    }
+
+    func testUnitConvertToolInvoke() async {
+        let tool = UnitConvertTool()
+        let out = await tool.invoke(arguments: #"{"value":10,"from":"km","to":"m"}"#)
+        XCTAssertEqual(out, "10 km = 10000 m")
+        let bad = await tool.invoke(arguments: #"{"value":1,"from":"m","to":"kg"}"#)
+        XCTAssertTrue(bad.contains("Can't convert"))
+    }
+
     // MARK: CurrentDateTimeTool (injectable clock)
 
     func testCurrentDateTimeToolUsesInjectedClock() async {

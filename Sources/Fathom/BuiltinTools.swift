@@ -128,6 +128,87 @@ public struct CalculatorTool: OrchestratorTool {
     }
 }
 
+/// Converts a value between units of length, mass, or temperature. Pure + deterministic
+/// → unit-testable. Length/mass use base-unit factors; temperature uses offset formulas.
+/// Unknown or cross-dimension pairs return nil.
+public enum UnitConvert {
+    /// Factor to the base unit (length base = metre, mass base = gram).
+    public static let length: [String: Double] = [
+        "m": 1, "km": 1000, "cm": 0.01, "mm": 0.001, "um": 1e-6, "nm": 1e-9,
+        "mi": 1609.344, "yd": 0.9144, "ft": 0.3048, "in": 0.0254,
+    ]
+    public static let mass: [String: Double] = [
+        "g": 1, "kg": 1000, "mg": 0.001, "t": 1_000_000, "lb": 453.59237, "oz": 28.349523125,
+    ]
+    public static let temps: Set<String> = ["c", "f", "k"]
+
+    /// Map many spellings/plurals to a canonical symbol, or nil if unrecognised.
+    public static func canonical(_ raw: String) -> String? {
+        var s = raw.trimmingCharacters(in: .whitespaces).lowercased()
+        let alias: [String: String] = [
+            "meter": "m", "metre": "m", "meters": "m", "metres": "m",
+            "kilometer": "km", "kilometre": "km", "kilometers": "km", "kilometres": "km", "kms": "km",
+            "centimeter": "cm", "centimetre": "cm", "centimeters": "cm",
+            "millimeter": "mm", "millimetre": "mm", "millimeters": "mm",
+            "micrometer": "um", "nanometer": "nm",
+            "mile": "mi", "miles": "mi", "yard": "yd", "yards": "yd",
+            "foot": "ft", "feet": "ft", "inch": "in", "inches": "in",
+            "gram": "g", "grams": "g", "gramme": "g", "kilogram": "kg", "kilograms": "kg", "kilo": "kg", "kgs": "kg",
+            "milligram": "mg", "milligrams": "mg", "tonne": "t", "tonnes": "t", "ton": "t",
+            "pound": "lb", "pounds": "lb", "lbs": "lb", "ounce": "oz", "ounces": "oz",
+            "celsius": "c", "centigrade": "c", "fahrenheit": "f", "kelvin": "k",
+        ]
+        if let a = alias[s] { return a }
+        if length[s] != nil || mass[s] != nil || temps.contains(s) { return s }
+        if s.hasSuffix("s"), case let trimmed = String(s.dropLast()),
+           length[trimmed] != nil || mass[trimmed] != nil { s = trimmed; return s }
+        return nil
+    }
+
+    public static func convert(_ value: Double, from rawFrom: String, to rawTo: String) -> Double? {
+        guard let f = canonical(rawFrom), let t = canonical(rawTo) else { return nil }
+        if let bf = length[f], let bt = length[t] { return value * bf / bt }
+        if let bf = mass[f], let bt = mass[t] { return value * bf / bt }
+        if temps.contains(f), temps.contains(t) { return convertTemp(value, from: f, to: t) }
+        return nil   // unknown or cross-dimension (e.g. m → kg)
+    }
+
+    /// Temperature via celsius as the pivot.
+    public static func convertTemp(_ v: Double, from f: String, to t: String) -> Double {
+        let c: Double
+        switch f { case "f": c = (v - 32) * 5 / 9; case "k": c = v - 273.15; default: c = v }
+        switch t { case "f": return c * 9 / 5 + 32; case "k": return c + 273.15; default: return c }
+    }
+}
+
+/// Built-in tool: convert between units of length, mass, or temperature.
+public struct UnitConvertTool: OrchestratorTool {
+    public init() {}
+    public var name: String { "unit_convert" }
+    public var toolDescription: String {
+        "Convert a value between units of length, mass, or temperature (e.g. 10 km to mi, 72 f to c). Exact."
+    }
+    public var parameters: [String: Any] {
+        ["type": "object",
+         "properties": [
+            "value": ["type": "number", "description": "the amount to convert"],
+            "from": ["type": "string", "description": "source unit, e.g. km, lb, celsius"],
+            "to": ["type": "string", "description": "target unit, e.g. mi, kg, fahrenheit"],
+         ],
+         "required": ["value", "from", "to"]]
+    }
+    public func invoke(arguments: String) async -> String {
+        guard let vs = jsonString(arguments, "value"), let v = Double(vs),
+              let from = jsonString(arguments, "from"), let to = jsonString(arguments, "to") else {
+            return "Missing 'value', 'from', or 'to'."
+        }
+        guard let r = UnitConvert.convert(v, from: from, to: to) else {
+            return "Can't convert '\(from)' to '\(to)' — unknown units or different dimensions."
+        }
+        return "\(Calculator.format(v)) \(from) = \(Calculator.format(r)) \(to)"
+    }
+}
+
 /// Built-in tool: the current date and time. `now` is injectable for deterministic tests.
 public struct CurrentDateTimeTool: OrchestratorTool {
     private let now: @Sendable () -> Date
