@@ -27,6 +27,8 @@ public struct Agent: Sendable {
                 planning: Bool = false,
                 critic: Bool = false,
                 tokenBudget: Int? = nil,
+                outputGuardrail: @escaping @Sendable (String) async -> GuardrailResult = { _ in .pass },
+                maxGuardrailRetries: Int = 1,
                 onStatus: @escaping @Sendable (String) -> Void = { _ in },
                 onObservation: @escaping @Sendable (Orchestrator.Observation) -> Void = { _ in },
                 approval: @escaping @Sendable (ToolCall) async -> ToolApproval = { _ in .allow }) {
@@ -35,7 +37,8 @@ public struct Agent: Sendable {
         self.orchestrator = Orchestrator(client: client, maxRounds: maxRounds,
                                          onStatus: onStatus, onObservation: onObservation,
                                          approval: approval, planning: planning, critic: critic,
-                                         tokenBudget: tokenBudget)
+                                         tokenBudget: tokenBudget,
+                                         outputGuardrail: outputGuardrail, maxGuardrailRetries: maxGuardrailRetries)
     }
 
     /// Run a single query (optionally with prior `history`) to completion.

@@ -76,11 +76,14 @@ public struct RunResult: Sendable {
     public let revised: Bool
     /// Cumulative token usage across every model call in the run.
     public let usage: Usage
+    /// How many times an output guardrail forced a regeneration.
+    public let guardrailRetries: Int
     public init(answer: String, messages: [ChatMessage], toolCallCount: Int,
                 finish: FinishReason, plan: [String] = [], revised: Bool = false,
-                usage: Usage = Usage()) {
+                usage: Usage = Usage(), guardrailRetries: Int = 0) {
         self.answer = answer; self.messages = messages; self.toolCallCount = toolCallCount
         self.finish = finish; self.plan = plan; self.revised = revised; self.usage = usage
+        self.guardrailRetries = guardrailRetries
     }
 }
 
@@ -88,4 +91,10 @@ public struct RunResult: Sendable {
 public enum CriticVerdict: Equatable, Sendable {
     case pass               // the answer is correct/complete/grounded
     case revise(String)     // needs work — carries the reviewer's feedback
+}
+
+/// A host-supplied output guardrail's verdict on the final answer.
+public enum GuardrailResult: Sendable, Equatable {
+    case pass               // the answer meets the requirement
+    case retry(String)      // regenerate — carries the reason fed back to the model
 }

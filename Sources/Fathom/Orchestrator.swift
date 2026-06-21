@@ -33,15 +33,25 @@ public struct Orchestrator: Sendable {
     /// loop stops requesting tools and produces a final answer (finish = `.budget`). nil =
     /// unbounded. Requires the client to report usage.
     public var tokenBudget: Int?
+    /// Output GUARDRAIL: validate the final answer; return `.retry(reason)` to regenerate
+    /// it (up to `maxGuardrailRetries`) with the reason fed back. Deterministic and
+    /// host-supplied — enforce JSON-parses, required fields, length, no-PII, etc. Defaults
+    /// to always-pass.
+    public var outputGuardrail: @Sendable (String) async -> GuardrailResult
+    /// How many times the output guardrail may force a regeneration.
+    public var maxGuardrailRetries: Int
 
     public init(client: LLMClient, maxRounds: Int = 8,
                 onStatus: @escaping @Sendable (String) -> Void = { _ in },
                 onObservation: @escaping @Sendable (Observation) -> Void = { _ in },
                 approval: @escaping @Sendable (ToolCall) async -> ToolApproval = { _ in .allow },
-                planning: Bool = false, critic: Bool = false, tokenBudget: Int? = nil) {
+                planning: Bool = false, critic: Bool = false, tokenBudget: Int? = nil,
+                outputGuardrail: @escaping @Sendable (String) async -> GuardrailResult = { _ in .pass },
+                maxGuardrailRetries: Int = 1) {
         self.client = client; self.maxRounds = maxRounds
         self.onStatus = onStatus; self.onObservation = onObservation; self.approval = approval
         self.planning = planning; self.critic = critic; self.tokenBudget = tokenBudget
+        self.outputGuardrail = outputGuardrail; self.maxGuardrailRetries = maxGuardrailRetries
     }
 
     /// One tool call and its outcome, reported to `onObservation`.
@@ -204,8 +214,26 @@ public struct Orchestrator: Sendable {
             }
         }
 
+        // GUARDRAIL phase — validate the answer; regenerate on failure (bounded). Skipped
+        // on cancellation.
+        var guardrailRetries = 0
+        if finish != .cancelled, !answer.isEmpty {
+            for _ in 0..<max(0, maxGuardrailRetries) {
+                guard case let .retry(reason) = await outputGuardrail(answer) else { break }
+                guardrailRetries += 1
+                onStatus("Checking the answer…")
+                convo.append(ChatMessage(role: .system,
+                    content: "Your answer didn't meet a requirement: \(reason)\nProduce a corrected answer that satisfies it. Answer directly."))
+                let redo = try await client.complete(messages: convo, tools: [])
+                usage = usage + (redo.usage ?? Usage())
+                let improved = redo.content ?? ""
+                if !improved.isEmpty { answer = improved }
+            }
+        }
+
         return RunResult(answer: answer, messages: convo, toolCallCount: calls,
-                         finish: finish, plan: plan, revised: revised, usage: usage)
+                         finish: finish, plan: plan, revised: revised, usage: usage,
+                         guardrailRetries: guardrailRetries)
     }
 
     // MARK: plan & verify phases
