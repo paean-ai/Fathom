@@ -76,4 +76,16 @@ final class BuiltinToolsTests: XCTestCase {
                       "ISO-8601 from the injected clock (TZ-dependent day): \(out)")
         XCTAssertFalse(tool.isMutating, "reading the clock is not a mutation")
     }
+
+    func testCurrentDateTimeHumanStyle() async {
+        let fixed = Date(timeIntervalSince1970: 1_700_000_000)
+        // The human render is a friendly sentence with weekday + month name.
+        let human = CurrentDateTimeTool.render(fixed, style: .human)
+        XCTAssertTrue(human.contains("November"), "human style spells the month: \(human)")
+        XCTAssertTrue(human.contains("2023"))
+        // The tool honors the configured style.
+        let tool = CurrentDateTimeTool(now: { fixed }, style: .human)
+        let out = await tool.invoke(arguments: "{}")
+        XCTAssertEqual(out, human)
+    }
 }

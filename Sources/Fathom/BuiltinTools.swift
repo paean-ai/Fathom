@@ -211,16 +211,33 @@ public struct UnitConvertTool: OrchestratorTool {
 
 /// Built-in tool: the current date and time. `now` is injectable for deterministic tests.
 public struct CurrentDateTimeTool: OrchestratorTool {
+    /// How to render a date: machine ISO-8601, or a friendly human sentence.
+    public enum Style: Sendable { case iso8601, human }
+
     private let now: @Sendable () -> Date
-    public init(now: @escaping @Sendable () -> Date = { Date() }) { self.now = now }
+    private let style: Style
+    public init(now: @escaping @Sendable () -> Date = { Date() }, style: Style = .iso8601) {
+        self.now = now; self.style = style
+    }
     public var name: String { "current_datetime" }
     public var toolDescription: String {
-        "The current date and time (ISO-8601, in the device's time zone). Use when the user asks what day/time it is or for date math relative to now."
+        "The current date and time (in the device's time zone). Use when the user asks what day/time it is or for date math relative to now."
     }
     public var parameters: [String: Any] { ["type": "object", "properties": [:]] }
-    public func invoke(arguments: String) async -> String {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        return f.string(from: now())
+    public func invoke(arguments: String) async -> String { Self.render(now(), style: style) }
+
+    /// Render a date in the requested style. Reusable directly (e.g. host apps that want
+    /// the friendly form). Pure for a given input.
+    public static func render(_ date: Date, style: Style = .iso8601) -> String {
+        switch style {
+        case .iso8601:
+            let f = ISO8601DateFormatter()
+            f.formatOptions = [.withInternetDateTime]
+            return f.string(from: date)
+        case .human:
+            let df = DateFormatter()
+            df.dateFormat = "EEEE, d MMMM yyyy, HH:mm zzz"
+            return df.string(from: date)
+        }
     }
 }
