@@ -2,16 +2,25 @@
 
 *Fathom the depths, surface the answer.*
 
-A small, dependency-free Swift package for driving a DeepSeek-style (OpenAI-compatible)
-tool-calling agent loop. You supply an `LLMClient` and a set of `OrchestratorTool`s; the
-`Orchestrator` runs the ACT loop until the model is ready to answer, with the safety rails
-baked in (battle-tested agent-loop safety rails):
+A small, dependency-free Swift **agent SDK** for DeepSeek-style (OpenAI-compatible) models.
+Define an `Agent` — a model + system prompt + tools + policies — and it drives a full
+tool-calling loop to an answer. Not just an API wrapper: it ships the machinery a real
+agent needs.
 
-- **No repeated tool calls** — identical calls (even with reordered JSON keys) are collapsed.
-- **No-progress cap** — two rounds that add nothing new force a final answer.
-- **Round cap** — a hard ceiling on tool-calling rounds.
+**What you get**
 
-It's fully mockable (inject any `LLMClient`) so the loop is testable offline, with no network.
+- **`Agent` + `Thread`** — a reusable agent, and stateful multi-turn conversations with memory.
+- **Tool-calling loop** with production safety rails:
+  - *No repeated tool calls* — identical calls (even with reordered JSON keys) are collapsed.
+  - *No-progress cap* — two rounds that add nothing new force a final answer.
+  - *Round cap* — a hard ceiling on tool-calling rounds.
+- **Human-in-the-loop approval** — mutating tools are gated through an `approval` hook; deny
+  with a reason and the model adapts. Read-only tools never prompt.
+- **Parallel tool execution** — independent tool calls in one round run concurrently.
+- **Observation hook** — collect side effects (citations, traces) as the loop runs.
+- **Resilience** — wrap any client in `RetryingClient` for retry + backoff on transient failures.
+
+Fully mockable (inject any `LLMClient`) — the whole thing is testable offline, no network.
 
 ## Install
 
@@ -43,19 +52,44 @@ let search = ClosureTool(
     "…results…"
 }
 
-let orchestrator = Orchestrator(client: client) { status in
-    print(status)   // e.g. "Running search…"
-}
-
-let result = try await orchestrator.run(
+let agent = Agent(
+    client: client,
     systemPrompt: "You are a helpful research assistant.",
-    query: "What changed in the Q3 report?",
     tools: [search]
 )
 
+let result = try await agent.run("What changed in the Q3 report?")
 print(result.answer)         // the model's final answer
 print(result.toolCallCount)  // how many tools ran
 print(result.finish)         // .natural / .noProgress / .roundLimit
+```
+
+### Multi-turn conversations
+
+```swift
+let thread = agent.thread()
+_ = try await thread.send("Summarize the report.")
+_ = try await thread.send("Now compare it to last year.")   // remembers the first turn
+print(thread.messages)   // the running transcript
+```
+
+### Human-in-the-loop approval
+
+Mutating tools (`isMutating: true`) are gated through `approval`; read-only tools never prompt.
+
+```swift
+let agent = Agent(
+    client: client, systemPrompt: "…", tools: [deleteTool],
+    approval: { call in
+        await userConfirms(call) ? .allow : .deny("user declined")
+    }
+)
+```
+
+### Resilience
+
+```swift
+let client = RetryingClient(wrapping: DeepSeekClient(config: cfg), maxAttempts: 4)
 ```
 
 ### Collecting side effects as the loop runs
@@ -64,10 +98,10 @@ print(result.finish)         // .natural / .noProgress / .roundLimit
 host uses to gather citations or traces without owning the loop:
 
 ```swift
-let orchestrator = Orchestrator(
-    client: client,
+let agent = Agent(
+    client: client, systemPrompt: "…", tools: tools,
     onObservation: { obs in
-        print(obs.toolName, obs.arguments, obs.isRepeat)
+        print(obs.toolName, obs.arguments, obs.isRepeat, obs.approved)
     }
 )
 ```

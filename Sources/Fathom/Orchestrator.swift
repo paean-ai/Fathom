@@ -1,9 +1,16 @@
 import Foundation
 
-/// A reusable DeepSeek tool-calling orchestrator. Runs the ACT loop (call tools until
-/// the model is ready to answer), with the safety rails learned from Claude Code/Codex:
-/// never repeat an identical tool call, stop after two no-progress rounds, and cap the
-/// total rounds. App-agnostic — supply any `LLMClient` and `[OrchestratorTool]`.
+/// A human-in-the-loop decision for a mutating tool call.
+public enum ToolApproval: Sendable, Equatable {
+    case allow
+    case deny(String)   // carries a reason fed back to the model
+}
+
+/// The agent core: runs the ACT loop (call tools until the model is ready to answer),
+/// with the safety rails of a production agent — never repeat an identical tool call,
+/// stop after two no-progress rounds, cap total rounds — PLUS human-in-the-loop
+/// approval for mutating tools and concurrent execution of independent tool calls.
+/// App-agnostic: supply any `LLMClient` and `[OrchestratorTool]`.
 public struct Orchestrator: Sendable {
     public let client: LLMClient
     public var maxRounds: Int
@@ -12,12 +19,17 @@ public struct Orchestrator: Sendable {
     /// Fires after EACH tool call with its result — the seam a host uses to collect
     /// side effects (e.g. citations) as the loop runs, without owning the loop itself.
     public var onObservation: @Sendable (Observation) -> Void
+    /// Consulted before a MUTATING tool runs (human-in-the-loop). Return `.deny(reason)`
+    /// to block it; the reason is fed back to the model so it can adapt. Non-mutating
+    /// tools are never gated. Defaults to auto-allow.
+    public var approval: @Sendable (ToolCall) async -> ToolApproval
 
     public init(client: LLMClient, maxRounds: Int = 8,
                 onStatus: @escaping @Sendable (String) -> Void = { _ in },
-                onObservation: @escaping @Sendable (Observation) -> Void = { _ in }) {
+                onObservation: @escaping @Sendable (Observation) -> Void = { _ in },
+                approval: @escaping @Sendable (ToolCall) async -> ToolApproval = { _ in .allow }) {
         self.client = client; self.maxRounds = maxRounds
-        self.onStatus = onStatus; self.onObservation = onObservation
+        self.onStatus = onStatus; self.onObservation = onObservation; self.approval = approval
     }
 
     /// One tool call and its outcome, reported to `onObservation`.
@@ -26,9 +38,11 @@ public struct Orchestrator: Sendable {
         public let arguments: String   // raw JSON the model sent
         public let result: String      // the tool's textual result (or the prior result on a repeat)
         public let isRepeat: Bool       // true when this exact call already ran this turn (skipped re-execution)
-        public init(toolName: String, arguments: String, result: String, isRepeat: Bool) {
+        public let approved: Bool       // false when a mutating call was denied by `approval`
+        public init(toolName: String, arguments: String, result: String,
+                    isRepeat: Bool, approved: Bool = true) {
             self.toolName = toolName; self.arguments = arguments
-            self.result = result; self.isRepeat = isRepeat
+            self.result = result; self.isRepeat = isRepeat; self.approved = approved
         }
     }
 
@@ -55,31 +69,64 @@ public struct Orchestrator: Sendable {
                 finish = .natural
                 break
             }
-
             convo.append(ChatMessage(role: .assistant, content: completion.content ?? "",
                                      toolCalls: completion.toolCalls))
 
-            var fresh = 0
+            // 1) CLASSIFY each call: a repeat (de-duped), a denied mutation, or runnable.
+            //    Approval is awaited here, sequentially, so a human prompt stays orderly.
+            enum Outcome { case repeated(String); case denied(String); case run(OrchestratorTool?) }
+            var plan: [(call: ToolCall, sig: String, outcome: Outcome)] = []
             for call in completion.toolCalls {
                 let sig = Self.callSignature(name: call.name, arguments: call.arguments)
-                if let prior = executed[sig] {
-                    onObservation(Observation(toolName: call.name, arguments: call.arguments,
+                if let prior = executed[sig] { plan.append((call, sig, .repeated(prior))); continue }
+                let tool = byName[call.name]
+                if let tool, tool.isMutating, case let .deny(reason) = await approval(call) {
+                    plan.append((call, sig, .denied(reason))); continue
+                }
+                plan.append((call, sig, .run(tool)))
+            }
+
+            // 2) EXECUTE the runnable calls CONCURRENTLY — independent tools shouldn't
+            //    serialize. Results are gathered by index so transcript order is stable.
+            var results: [Int: String] = [:]
+            await withTaskGroup(of: (Int, String).self) { group in
+                for (i, step) in plan.enumerated() {
+                    guard case let .run(tool) = step.outcome else { continue }
+                    onStatus("Running \(step.call.name)…")
+                    let call = step.call
+                    group.addTask {
+                        if let tool { return (i, await tool.invoke(arguments: call.arguments)) }
+                        return (i, "Unknown tool '\(call.name)'.")
+                    }
+                }
+                for await (i, r) in group { results[i] = r }
+            }
+
+            // 3) THREAD results back in the model's original call order.
+            var fresh = 0
+            for (i, step) in plan.enumerated() {
+                switch step.outcome {
+                case let .repeated(prior):
+                    onObservation(Observation(toolName: step.call.name, arguments: step.call.arguments,
                                               result: prior, isRepeat: true))
                     convo.append(ChatMessage(role: .tool,
-                        content: "(Already called \(call.name) with these exact arguments. Result was:\n\(prior)\nDon't repeat it — use it, try different arguments/another tool, or answer.)",
-                        toolCallID: call.id))
-                    continue
+                        content: "(Already called \(step.call.name) with these exact arguments. Result was:\n\(prior)\nDon't repeat it — use it, try different arguments/another tool, or answer.)",
+                        toolCallID: step.call.id))
+                case let .denied(reason):
+                    fresh += 1   // a human decision IS progress — don't count it as a stall
+                    onObservation(Observation(toolName: step.call.name, arguments: step.call.arguments,
+                                              result: "declined: \(reason)", isRepeat: false, approved: false))
+                    convo.append(ChatMessage(role: .tool,
+                        content: "Action declined by the user (\(reason)). Do not retry it — continue with another approach or finish.",
+                        toolCallID: step.call.id))
+                case .run:
+                    let result = results[i] ?? "(no result)"
+                    fresh += 1; calls += 1
+                    executed[step.sig] = result
+                    onObservation(Observation(toolName: step.call.name, arguments: step.call.arguments,
+                                              result: result, isRepeat: false))
+                    convo.append(ChatMessage(role: .tool, content: result, toolCallID: step.call.id))
                 }
-                fresh += 1
-                calls += 1
-                onStatus("Running \(call.name)…")
-                let result: String
-                if let tool = byName[call.name] { result = await tool.invoke(arguments: call.arguments) }
-                else { result = "Unknown tool '\(call.name)'." }
-                executed[sig] = result
-                onObservation(Observation(toolName: call.name, arguments: call.arguments,
-                                          result: result, isRepeat: false))
-                convo.append(ChatMessage(role: .tool, content: result, toolCallID: call.id))
             }
 
             if Self.isStall(freshCalls: fresh) {
