@@ -51,4 +51,19 @@ public struct RunResult: Sendable {
     public let messages: [ChatMessage]   // full transcript incl. tool results
     public let toolCallCount: Int
     public let finish: FinishReason
+    /// The decomposed steps, when planning was enabled (empty otherwise).
+    public let plan: [String]
+    /// True when the critic flagged the first answer and it was revised.
+    public let revised: Bool
+    public init(answer: String, messages: [ChatMessage], toolCallCount: Int,
+                finish: FinishReason, plan: [String] = [], revised: Bool = false) {
+        self.answer = answer; self.messages = messages; self.toolCallCount = toolCallCount
+        self.finish = finish; self.plan = plan; self.revised = revised
+    }
+}
+
+/// A reviewer's verdict on a draft answer (the VERIFY phase).
+public enum CriticVerdict: Equatable, Sendable {
+    case pass               // the answer is correct/complete/grounded
+    case revise(String)     // needs work — carries the reviewer's feedback
 }

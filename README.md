@@ -10,6 +10,8 @@ agent needs.
 **What you get**
 
 - **`Agent` + `Thread`** — a reusable agent, and stateful multi-turn conversations with memory.
+- **Plan → Act → Verify** — optional planning (decompose the goal into steps first) and a
+  critic (review the draft answer and revise once if it falls short) — a *thinking* agent.
 - **Tool-calling loop** with production safety rails:
   - *No repeated tool calls* — identical calls (even with reordered JSON keys) are collapsed.
   - *No-progress cap* — two rounds that add nothing new force a final answer.
@@ -84,6 +86,18 @@ let agent = Agent(
         await userConfirms(call) ? .allow : .deny("user declined")
     }
 )
+```
+
+### Plan → Act → Verify
+
+Turn on planning (decompose first) and the critic (review + revise) for a thinking agent:
+
+```swift
+let agent = Agent(client: client, systemPrompt: "…", tools: tools,
+                  planning: true, critic: true)
+let result = try await agent.run("Compare last two quarterly reports and flag risks.")
+print(result.plan)      // the steps it decomposed the goal into
+print(result.revised)   // true if the critic forced a revision
 ```
 
 ### Resilience

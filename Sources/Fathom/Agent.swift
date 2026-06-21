@@ -24,6 +24,8 @@ public struct Agent: Sendable {
                 systemPrompt: String,
                 tools: [OrchestratorTool] = [],
                 maxRounds: Int = 8,
+                planning: Bool = false,
+                critic: Bool = false,
                 onStatus: @escaping @Sendable (String) -> Void = { _ in },
                 onObservation: @escaping @Sendable (Orchestrator.Observation) -> Void = { _ in },
                 approval: @escaping @Sendable (ToolCall) async -> ToolApproval = { _ in .allow }) {
@@ -31,7 +33,7 @@ public struct Agent: Sendable {
         self.tools = tools
         self.orchestrator = Orchestrator(client: client, maxRounds: maxRounds,
                                          onStatus: onStatus, onObservation: onObservation,
-                                         approval: approval)
+                                         approval: approval, planning: planning, critic: critic)
     }
 
     /// Run a single query (optionally with prior `history`) to completion.

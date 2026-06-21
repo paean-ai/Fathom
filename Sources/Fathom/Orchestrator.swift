@@ -23,13 +23,21 @@ public struct Orchestrator: Sendable {
     /// to block it; the reason is fed back to the model so it can adapt. Non-mutating
     /// tools are never gated. Defaults to auto-allow.
     public var approval: @Sendable (ToolCall) async -> ToolApproval
+    /// PLAN phase: when true, the agent first decomposes the goal into steps and works
+    /// through them (think before acting). Off by default.
+    public var planning: Bool
+    /// VERIFY phase: when true, a critic reviews the draft answer and the agent revises
+    /// once if it falls short (reflection). Off by default.
+    public var critic: Bool
 
     public init(client: LLMClient, maxRounds: Int = 8,
                 onStatus: @escaping @Sendable (String) -> Void = { _ in },
                 onObservation: @escaping @Sendable (Observation) -> Void = { _ in },
-                approval: @escaping @Sendable (ToolCall) async -> ToolApproval = { _ in .allow }) {
+                approval: @escaping @Sendable (ToolCall) async -> ToolApproval = { _ in .allow },
+                planning: Bool = false, critic: Bool = false) {
         self.client = client; self.maxRounds = maxRounds
         self.onStatus = onStatus; self.onObservation = onObservation; self.approval = approval
+        self.planning = planning; self.critic = critic
     }
 
     /// One tool call and its outcome, reported to `onObservation`.
@@ -55,6 +63,18 @@ public struct Orchestrator: Sendable {
         var convo: [ChatMessage] = [ChatMessage(role: .system, content: systemPrompt)]
         convo += history.filter { $0.role == .user || $0.role == .assistant || $0.role == .system }
         convo.append(ChatMessage(role: .user, content: query))
+
+        // PLAN phase — decompose the goal first, then let the loop work the steps.
+        var plan: [String] = []
+        if planning {
+            onStatus("Planning…")
+            plan = try await makePlan(query: query)
+            if !plan.isEmpty {
+                let numbered = plan.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
+                convo.append(ChatMessage(role: .system,
+                    content: "PLAN — work through these steps with the right tool for each, then answer:\n\(numbered)"))
+            }
+        }
 
         var executed: [String: String] = [:]   // de-dup: signature → prior result
         var calls = 0
@@ -142,14 +162,85 @@ public struct Orchestrator: Sendable {
 
         // If the model already answered in-loop (no tools), that text IS the answer.
         // Otherwise (round/no-progress cap) ask once more, tool-free, for a closing answer.
-        let answer: String
+        var answer: String
         if let naturalAnswer {
             answer = naturalAnswer
         } else {
             let final = try await client.complete(messages: convo, tools: [])
             answer = final.content ?? ""
         }
-        return RunResult(answer: answer, messages: convo, toolCallCount: calls, finish: finish)
+
+        // VERIFY phase — a critic reviews the draft; revise once if it falls short.
+        var revised = false
+        if critic, !answer.isEmpty {
+            onStatus("Reviewing…")
+            if case let .revise(feedback) = try await runCritic(query: query, answer: answer) {
+                convo.append(ChatMessage(role: .system,
+                    content: "A reviewer flagged the answer: \(feedback)\nRevise it to fully address this. Answer directly."))
+                let redo = try await client.complete(messages: convo, tools: [])
+                let improved = redo.content ?? ""
+                if !improved.isEmpty { answer = improved; revised = true }
+            }
+        }
+
+        return RunResult(answer: answer, messages: convo, toolCallCount: calls,
+                         finish: finish, plan: plan, revised: revised)
+    }
+
+    // MARK: plan & verify phases
+
+    /// Ask the model to decompose the goal into a short ordered list of steps.
+    private func makePlan(query: String) async throws -> [String] {
+        let msgs = [
+            ChatMessage(role: .system, content: "You are a planner. Break the user's request into 2–6 short imperative steps. Reply with a numbered list and nothing else. If the request is trivial, reply with a single step."),
+            ChatMessage(role: .user, content: query),
+        ]
+        let c = try await client.complete(messages: msgs, tools: [])
+        return Self.parsePlanSteps(c.content ?? "")
+    }
+
+    /// Ask a strict reviewer whether the draft answer is good enough.
+    private func runCritic(query: String, answer: String) async throws -> CriticVerdict {
+        let msgs = [
+            ChatMessage(role: .system, content: "You are a strict reviewer. Given the request and the agent's answer, decide if the answer is correct, complete, and grounded. If it is, reply exactly 'PASS'. Otherwise reply 'REVISE: <what is missing or wrong>'."),
+            ChatMessage(role: .user, content: "Request: \(query)\n\nAnswer: \(answer)"),
+        ]
+        let c = try await client.complete(messages: msgs, tools: [])
+        return Self.parseCritic(c.content ?? "")
+    }
+
+    /// Parse a model's plan reply into clean steps. Prefers genuine list items (so a
+    /// preamble/closing line isn't mistaken for a step), strips numbering/bullets, and
+    /// de-duplicates. Pure → unit-testable.
+    public static func parsePlanSteps(_ text: String) -> [String] {
+        func strip(_ t: String) -> String {
+            t.replacingOccurrences(of: #"^\d+[\.\)]\s*"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: #"^[-•*]\s*"#, with: "", options: .regularExpression)
+                .trimmingCharacters(in: .whitespaces)
+        }
+        let lines = text.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let marked = lines.filter { $0.range(of: #"^(\d+[\.\)]|[-•*])\s+"#, options: .regularExpression) != nil }
+        let source = marked.count >= 2 ? marked : lines
+        var seen = Set<String>(); var out: [String] = []
+        for line in source {
+            let s = strip(line)
+            if s.count >= 2, seen.insert(s.lowercased()).inserted { out.append(s) }
+        }
+        return out
+    }
+
+    /// Parse a critic reply into a verdict. "PASS"/"OK" → pass; "REVISE: …" → revise with
+    /// the feedback; anything ambiguous defaults to pass (don't block on noise). Pure.
+    public static func parseCritic(_ text: String) -> CriticVerdict {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let upper = trimmed.uppercased()
+        if upper.hasPrefix("PASS") || upper == "OK" || upper.hasPrefix("OK.") { return .pass }
+        if upper.hasPrefix("REVISE") {
+            let after = trimmed.drop { $0 != ":" }.dropFirst().trimmingCharacters(in: .whitespaces)
+            return .revise(after.isEmpty ? "the answer needs to be more complete" : after)
+        }
+        return .pass
     }
 
     // MARK: pure helpers (loop safety rails)
