@@ -9,7 +9,9 @@ agent needs.
 
 **What you get**
 
-- **`Agent` + `Thread`** — a reusable agent, and stateful multi-turn conversations with memory.
+- **`Agent` + `Thread`** — a reusable agent, and stateful multi-turn conversations with memory; optional
+  **context compaction** summarizes old turns once the transcript grows past a `contextLimit`, so long-running
+  conversations stay within the window.
 - **Plan → Act → Verify** — optional planning (decompose the goal into steps first) and a
   critic (review the draft answer and revise once if it falls short) — a *thinking* agent.
 - **Tool-calling loop** with production safety rails:
