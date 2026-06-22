@@ -55,9 +55,11 @@ public struct DeepSeekClient: LLMClient {
         let msg = decoded.choices.first?.message
         let calls = (msg?.toolCalls ?? []).map { ToolCall(id: $0.id, name: $0.function.name, arguments: $0.function.arguments) }
         let usage = decoded.usage.map {
-            Usage(prompt: $0.promptTokens ?? 0, completion: $0.completionTokens ?? 0, total: $0.totalTokens)
+            Usage(prompt: $0.promptTokens ?? 0, completion: $0.completionTokens ?? 0, total: $0.totalTokens,
+                  cacheHit: $0.cacheHitTokens ?? 0, cacheMiss: $0.cacheMissTokens ?? 0)
         }
-        return Completion(content: msg?.content, toolCalls: calls, usage: usage)
+        let reasoning = msg?.reasoningContent.flatMap { $0.isEmpty ? nil : $0 }
+        return Completion(content: msg?.content, toolCalls: calls, usage: usage, reasoningContent: reasoning)
     }
 
     /// Convert a ChatMessage to the wire JSON the API expects.
@@ -78,14 +80,19 @@ public struct DeepSeekClient: LLMClient {
         struct Msg: Decodable {
             let content: String?
             let toolCalls: [Call]?
-            enum CodingKeys: String, CodingKey { case content, toolCalls = "tool_calls" }
+            let reasoningContent: String?
+            enum CodingKeys: String, CodingKey {
+                case content, toolCalls = "tool_calls", reasoningContent = "reasoning_content"
+            }
         }
         struct Call: Decodable { let id: String; let function: Fn }
         struct Fn: Decodable { let name: String; let arguments: String }
         struct UsageWire: Decodable {
             let promptTokens: Int?; let completionTokens: Int?; let totalTokens: Int?
+            let cacheHitTokens: Int?; let cacheMissTokens: Int?
             enum CodingKeys: String, CodingKey {
                 case promptTokens = "prompt_tokens", completionTokens = "completion_tokens", totalTokens = "total_tokens"
+                case cacheHitTokens = "prompt_cache_hit_tokens", cacheMissTokens = "prompt_cache_miss_tokens"
             }
         }
         let choices: [Choice]

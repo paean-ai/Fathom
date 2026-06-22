@@ -33,14 +33,27 @@ public struct Usage: Sendable, Equatable {
     public var promptTokens: Int
     public var completionTokens: Int
     public var totalTokens: Int
-    public init(prompt: Int = 0, completion: Int = 0, total: Int? = nil) {
+    /// DeepSeek-native context-cache counters (`prompt_cache_hit_tokens` / `_miss_tokens`). Cache
+    /// hits bill at a fraction of the miss price; 0 when the provider doesn't report them.
+    public var cacheHitTokens: Int
+    public var cacheMissTokens: Int
+    public init(prompt: Int = 0, completion: Int = 0, total: Int? = nil,
+                cacheHit: Int = 0, cacheMiss: Int = 0) {
         promptTokens = prompt; completionTokens = completion
         totalTokens = total ?? (prompt + completion)
+        cacheHitTokens = cacheHit; cacheMissTokens = cacheMiss
+    }
+    /// Fraction (0…1) of prompt tokens served from cache, or nil when no cache info was reported.
+    public var cacheHitRate: Double? {
+        let cached = cacheHitTokens + cacheMissTokens
+        return cached > 0 ? Double(cacheHitTokens) / Double(cached) : nil
     }
     public static func + (a: Usage, b: Usage) -> Usage {
         Usage(prompt: a.promptTokens + b.promptTokens,
               completion: a.completionTokens + b.completionTokens,
-              total: a.totalTokens + b.totalTokens)
+              total: a.totalTokens + b.totalTokens,
+              cacheHit: a.cacheHitTokens + b.cacheHitTokens,
+              cacheMiss: a.cacheMissTokens + b.cacheMissTokens)
     }
 }
 
@@ -49,8 +62,13 @@ public struct Completion: Sendable, Equatable {
     public let content: String?
     public let toolCalls: [ToolCall]
     public let usage: Usage?
-    public init(content: String?, toolCalls: [ToolCall] = [], usage: Usage? = nil) {
+    /// DeepSeek-native: the `reasoning_content` chain-of-thought emitted by reasoning models
+    /// (e.g. deepseek-reasoner) alongside the answer. nil for models that don't produce it.
+    public let reasoningContent: String?
+    public init(content: String?, toolCalls: [ToolCall] = [], usage: Usage? = nil,
+                reasoningContent: String? = nil) {
         self.content = content; self.toolCalls = toolCalls; self.usage = usage
+        self.reasoningContent = reasoningContent
     }
     public var wantsTools: Bool { !toolCalls.isEmpty }
 }
