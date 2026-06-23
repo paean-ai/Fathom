@@ -91,12 +91,89 @@ public enum MCP {
            let s = String(data: d, encoding: .utf8) { return s }
         return nil
     }
+
+    // MARK: stdio wire framing (newline-delimited JSON-RPC)
+
+    /// Serialize a JSON-RPC message to bytes (no framing) — the `Sendable` form a transport ships.
+    public static func encode(_ message: [String: Any]) -> Data {
+        (try? JSONSerialization.data(withJSONObject: message)) ?? Data("{}".utf8)
+    }
+
+    /// Encode a JSON-RPC message as a single newline-terminated line — the MCP stdio wire format
+    /// ("messages are delimited by newlines and MUST NOT contain embedded newlines").
+    public static func encodeMessage(_ message: [String: Any]) -> Data {
+        var d = encode(message)
+        d.append(0x0A)   // '\n'
+        return d
+    }
+
+    /// The `id` of a JSON-RPC message line, or nil for notifications / unparseable lines.
+    public static func messageID(_ line: Data) -> Int? {
+        ((try? JSONSerialization.jsonObject(with: line)) as? [String: Any])?["id"] as? Int
+    }
+
+    /// Accumulates bytes from a stdio stream and yields complete newline-delimited messages.
+    /// A partial trailing line is held until the rest arrives, so a message split across reads is
+    /// reassembled correctly.
+    public struct MessageFramer: Sendable {
+        private var buffer = Data()
+        public init() {}
+        /// Append new bytes; return any now-complete messages (trailing newline stripped, blanks skipped).
+        public mutating func push(_ data: Data) -> [Data] {
+            buffer.append(data)
+            var out: [Data] = []
+            while let nl = buffer.firstIndex(of: 0x0A) {
+                let line = buffer[buffer.startIndex..<nl]
+                if !line.isEmpty { out.append(Data(line)) }
+                buffer.removeSubrange(buffer.startIndex...nl)
+            }
+            return out
+        }
+    }
 }
 
-/// Transport that ships a JSON-RPC request to an MCP server and returns its raw response body.
-/// Implemented host-side (stdio subprocess / HTTP); injected so the protocol layer stays testable.
+/// Errors raised by the host-side MCP transports.
+public enum MCPError: Error, Sendable {
+    /// The server closed its stdout (EOF) before answering.
+    case connectionClosed
+    /// The transport could not launch the server process.
+    case launchFailed(String)
+}
+
+/// Drives the MCP handshake over any `MCPTransport` and bridges the server's tools into Fathom
+/// `OrchestratorTool`s. One `connect()` runs `initialize` then `tools/list`, returning ready-to-run
+/// tools — drop them straight into `Orchestrator.run`'s tool list, exactly like Claude Code attaches
+/// an MCP server's tools to its session.
+public struct MCPClient: Sendable {
+    private let transport: any MCPTransport
+    private let clientName: String
+    private let clientVersion: String
+
+    public init(transport: any MCPTransport, clientName: String = "Fathom", clientVersion: String = "1.0") {
+        self.transport = transport
+        self.clientName = clientName
+        self.clientVersion = clientVersion
+    }
+
+    /// Handshake + list tools. `isMutating` is applied to every bridged tool (MCP servers may have
+    /// side effects, so the default is `true`; pass `false` for a known read-only server to let the
+    /// orchestrator's guardrails treat them as safe).
+    public func connect(isMutating: Bool = true) async throws -> [OrchestratorTool] {
+        _ = try await transport.send(MCP.encode(MCP.initializeRequest(id: 1, clientName: clientName, clientVersion: clientVersion)))
+        let listData = try await transport.send(MCP.encode(MCP.listToolsRequest(id: 2)))
+        let defs = MCP.parseToolsList(listData)
+        return defs.enumerated().map { index, def in
+            MCPTool(def: def, transport: transport, isMutating: isMutating, callID: 1000 + index)
+        }
+    }
+}
+
+/// Transport that ships a JSON-RPC request (serialized via `MCP.encode`) to an MCP server and
+/// returns its raw response message bytes. Implemented host-side (stdio subprocess / HTTP) and
+/// injected so the protocol layer stays testable. Ships `Data` (Sendable) rather than a dictionary
+/// so an `actor` transport can satisfy it under Swift 6 strict concurrency.
 public protocol MCPTransport: Sendable {
-    func send(_ request: [String: Any]) async throws -> Data
+    func send(_ request: Data) async throws -> Data
 }
 
 /// Adapts one MCP `ToolDef` into a Fathom `OrchestratorTool`, so MCP-served tools drop straight
@@ -129,7 +206,7 @@ public struct MCPTool: OrchestratorTool {
         let args = (try? JSONSerialization.jsonObject(with: Data(arguments.utf8))) as? [String: Any] ?? [:]
         let req = MCP.callToolRequest(id: callID, name: name, arguments: args)
         do {
-            let data = try await transport.send(req)
+            let data = try await transport.send(MCP.encode(req))
             return MCP.parseToolResult(data) ?? "(empty MCP response)"
         } catch {
             return "MCP call failed: \(error.localizedDescription)"

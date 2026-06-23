@@ -49,8 +49,9 @@ final class MCPTests: XCTestCase {
     func testMCPToolBridgesToOrchestratorTool() async {
         // A mock transport that echoes the request back as a text result.
         struct EchoTransport: MCPTransport {
-            func send(_ request: [String: Any]) async throws -> Data {
-                let name = (request["params"] as? [String: Any])?["name"] as? String ?? "?"
+            func send(_ request: Data) async throws -> Data {
+                let obj = (try? JSONSerialization.jsonObject(with: request)) as? [String: Any]
+                let name = (obj?["params"] as? [String: Any])?["name"] as? String ?? "?"
                 return Data(#"{"result":{"content":[{"type":"text","text":"ran \#(name)"}]}}"#.utf8)
             }
         }
@@ -64,5 +65,78 @@ final class MCPTests: XCTestCase {
         // The bridged schema is the OpenAI-style function wrapper around the inputSchema.
         let fn = tool.schema["function"] as? [String: Any]
         XCTAssertEqual(fn?["name"] as? String, "read_file")
+    }
+
+    // MARK: stdio framing
+
+    func testEncodeMessageIsNewlineTerminatedJSON() {
+        let d = MCP.encodeMessage(["jsonrpc": "2.0", "id": 5, "method": "ping"])
+        XCTAssertEqual(d.last, 0x0A)
+        let obj = (try? JSONSerialization.jsonObject(with: d.dropLast())) as? [String: Any]
+        XCTAssertEqual(obj?["id"] as? Int, 5)
+        XCTAssertEqual(obj?["method"] as? String, "ping")
+    }
+
+    func testMessageIDExtractsIdAndSkipsNotifications() {
+        XCTAssertEqual(MCP.messageID(data(#"{"jsonrpc":"2.0","id":42,"result":{}}"#)), 42)
+        XCTAssertNil(MCP.messageID(data(#"{"jsonrpc":"2.0","method":"notify"}"#)))   // notification
+        XCTAssertNil(MCP.messageID(data("not json")))
+    }
+
+    func testFramerReassemblesAcrossChunksAndSplitsLines() {
+        var framer = MCP.MessageFramer()
+        // A message split across two reads yields nothing until the newline arrives.
+        XCTAssertTrue(framer.push(data(#"{"id":1,"#)).isEmpty)
+        let first = framer.push(data("\"x\":true}\n"))
+        XCTAssertEqual(first.count, 1)
+        XCTAssertEqual(MCP.messageID(first[0]), 1)
+        // Two messages plus a partial third in one chunk: two emitted, partial held.
+        let batch = framer.push(data("{\"id\":2}\n{\"id\":3}\n{\"id\":4"))
+        XCTAssertEqual(batch.map { MCP.messageID($0) }, [2, 3])
+        // The held partial completes when its newline arrives.
+        XCTAssertEqual(framer.push(data("}\n")).map { MCP.messageID($0) }, [4])
+        // Blank lines carry no message.
+        var blanks = MCP.MessageFramer()
+        XCTAssertTrue(blanks.push(data("\n\n")).isEmpty)
+    }
+
+    // MARK: client connect-flow (mock transport)
+
+    func testClientConnectRunsHandshakeAndBridgesTools() async throws {
+        // A mock server: acks initialize, lists two tools, echoes tool calls.
+        struct MockServer: MCPTransport {
+            func send(_ request: Data) async throws -> Data {
+                let req = (try? JSONSerialization.jsonObject(with: request)) as? [String: Any] ?? [:]
+                switch req["method"] as? String {
+                case "initialize":
+                    return Data(#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{}}}"#.utf8)
+                case "tools/list":
+                    return Data(#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"read_file","description":"Read","inputSchema":{"type":"object"}},{"name":"write_file","description":"Write","inputSchema":{"type":"object"}}]}}"#.utf8)
+                case "tools/call":
+                    let name = (req["params"] as? [String: Any])?["name"] as? String ?? "?"
+                    return Data(#"{"result":{"content":[{"type":"text","text":"ran \#(name)"}]}}"#.utf8)
+                default:
+                    return Data(#"{"result":{}}"#.utf8)
+                }
+            }
+        }
+        let tools = try await MCPClient(transport: MockServer()).connect()
+        XCTAssertEqual(tools.map(\.name), ["read_file", "write_file"])
+        let out = await tools[0].invoke(arguments: #"{"path":"/tmp/x"}"#)
+        XCTAssertEqual(out, "ran read_file")
+    }
+
+    // MARK: real stdio transport (round-trips a line through /bin/cat)
+
+    func testStdioTransportRoundTripsThroughCat() async throws {
+        // `cat` echoes stdin to stdout, so writing a well-formed JSON-RPC *response* line and reading
+        // it back exercises the full write → frame → id-match path against a real Process + pipes.
+        let cat = FileManager.default.fileExists(atPath: "/bin/cat") ? "/bin/cat" : "/usr/bin/cat"
+        let transport = StdioMCPTransport(executable: cat)
+        let echoed = try await transport.send(MCP.encode(["jsonrpc": "2.0", "id": 1, "result": ["ok": true]]))
+        XCTAssertEqual(MCP.messageID(echoed), 1)
+        let obj = (try? JSONSerialization.jsonObject(with: echoed)) as? [String: Any]
+        XCTAssertEqual((obj?["result"] as? [String: Any])?["ok"] as? Bool, true)
+        await transport.close()
     }
 }
