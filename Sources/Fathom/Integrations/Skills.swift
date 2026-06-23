@@ -99,4 +99,35 @@ public struct SkillRegistry: Sendable {
     public func systemAddendum(for query: String, limit: Int = 2) -> String {
         match(query).prefix(limit).map(\.systemAddendum).joined(separator: "\n\n")
     }
+
+    /// Load skills from a directory laid out like Claude Code's `skills/` folder — each skill is a
+    /// `<skill-name>/SKILL.md`; a top-level `*.md` is also accepted as a single skill. Files that
+    /// don't parse (no `name` frontmatter) are skipped. Discovery is sorted by path so the result is
+    /// deterministic. A missing/unreadable directory yields an empty registry rather than throwing.
+    public static func load(fromDirectory root: String, fileManager: FileManager = .default) -> SkillRegistry {
+        var registry = SkillRegistry()
+        let rootURL = URL(fileURLWithPath: root, isDirectory: true)
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: rootURL, includingPropertiesForKeys: [.isDirectoryKey]) else { return registry }
+
+        // Resolve the SKILL.md files to read, in a stable order.
+        var files: [URL] = []
+        for url in entries.sorted(by: { $0.path < $1.path }) {
+            var isDir: ObjCBool = false
+            let exists = fileManager.fileExists(atPath: url.path, isDirectory: &isDir)
+            if exists && isDir.boolValue {
+                let nested = url.appendingPathComponent("SKILL.md")
+                if fileManager.fileExists(atPath: nested.path) { files.append(nested) }
+            } else if url.pathExtension.lowercased() == "md" {
+                files.append(url)
+            }
+        }
+
+        for file in files {
+            guard let text = try? String(contentsOf: file, encoding: .utf8),
+                  let skill = Skill.parse(markdown: text) else { continue }
+            registry.register(skill)
+        }
+        return registry
+    }
 }

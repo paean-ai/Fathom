@@ -59,4 +59,44 @@ final class SkillsTests: XCTestCase {
         XCTAssertTrue(addendum.contains("Do PDF things."))
         XCTAssertTrue(reg.systemAddendum(for: "totally unrelated").isEmpty)
     }
+
+    // MARK: load-from-directory
+
+    func testLoadFromDirectoryReadsSkillFolders() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("fathom-skills-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: root) }
+
+        // skills/git/SKILL.md and skills/pdf/SKILL.md, plus a noise folder without a SKILL.md.
+        func writeSkill(_ folder: String, _ contents: String) throws {
+            let dir = root.appendingPathComponent(folder)
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            try contents.write(to: dir.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8)
+        }
+        try writeSkill("git", "---\nname: git\ndescription: version control commits\n---\nStage then commit.")
+        try writeSkill("pdf", "---\nname: pdf\ndescription: summarize pdf documents\n---\nExtract then summarize.")
+        // A folder with no SKILL.md is ignored.
+        try fm.createDirectory(at: root.appendingPathComponent("empty"), withIntermediateDirectories: true)
+
+        let reg = SkillRegistry.load(fromDirectory: root.path)
+        XCTAssertEqual(Set(reg.skills.map(\.name)), ["git", "pdf"])
+        XCTAssertEqual(reg.match("make a git commit").first?.name, "git")
+        XCTAssertTrue(reg.systemAddendum(for: "summarize a pdf").contains("Extract then summarize."))
+    }
+
+    func testLoadSkipsMalformedAndMissingDirectory() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("fathom-skills-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: root) }
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        // A top-level .md without a name is skipped; a valid one loads.
+        try "no frontmatter, no name".write(to: root.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+        try "---\nname: solo\ndescription: a lone skill\n---\nDo the thing."
+            .write(to: root.appendingPathComponent("solo.md"), atomically: true, encoding: .utf8)
+
+        let reg = SkillRegistry.load(fromDirectory: root.path)
+        XCTAssertEqual(reg.skills.map(\.name), ["solo"])
+        // A directory that doesn't exist yields an empty registry, not a crash.
+        XCTAssertTrue(SkillRegistry.load(fromDirectory: root.path + "/does-not-exist").skills.isEmpty)
+    }
 }
