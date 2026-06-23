@@ -22,6 +22,54 @@ final class SubAgentTests: XCTestCase {
         XCTAssertTrue(out.contains("Missing"))
     }
 
+    // MARK: SubAgentRouterTool (dynamic specialist routing)
+
+    func testRouterDescriptionEnumeratesSpecialistsAndConstrainsType() {
+        let router = SubAgentRouterTool(specialists: [
+            Specialist(type: "researcher", description: "Deep research", agent: Agent(client: MockClient([]), systemPrompt: "r")),
+            Specialist(type: "coder", description: "Write code", agent: Agent(client: MockClient([]), systemPrompt: "c")),
+        ])
+        XCTAssertEqual(router.name, "spawn_subagent")
+        XCTAssertTrue(router.isMutating)
+        XCTAssertTrue(router.toolDescription.contains("researcher: Deep research"))
+        XCTAssertTrue(router.toolDescription.contains("coder: Write code"))
+        let props = router.parameters["properties"] as? [String: Any]
+        let typeEnum = (props?["type"] as? [String: Any])?["enum"] as? [String]
+        XCTAssertEqual(typeEnum, ["researcher", "coder"])   // order preserved, model constrained to the menu
+    }
+
+    func testRouterRoutesToTheChosenSpecialist() async {
+        let researchClient = MockClient([Completion(content: "research findings")])
+        let coderClient = MockClient([Completion(content: "code written")])
+        let router = SubAgentRouterTool(specialists: [
+            Specialist(type: "researcher", description: "Deep research", agent: Agent(client: researchClient, systemPrompt: "you research")),
+            Specialist(type: "coder", description: "Write code", agent: Agent(client: coderClient, systemPrompt: "you code")),
+        ])
+
+        let out = await router.invoke(arguments: #"{"type":"coder","task":"implement the parser"}"#)
+        XCTAssertEqual(out, "code written")
+        // Only the coder ran; the researcher was never invoked.
+        XCTAssertTrue(coderClient.sentMessages.last!.contains { $0.role == .user && $0.content == "implement the parser" })
+        XCTAssertTrue(researchClient.sentMessages.isEmpty)
+    }
+
+    func testRouterUnknownTypeListsValidOptions() async {
+        let router = SubAgentRouterTool(specialists: [
+            Specialist(type: "researcher", description: "Deep research", agent: Agent(client: MockClient([]), systemPrompt: "r")),
+        ])
+        let out = await router.invoke(arguments: #"{"type":"wizard","task":"do magic"}"#)
+        XCTAssertTrue(out.contains("Unknown specialist type 'wizard'"))
+        XCTAssertTrue(out.contains("researcher"))
+    }
+
+    func testRouterMissingTask() async {
+        let router = SubAgentRouterTool(specialists: [
+            Specialist(type: "x", description: "y", agent: Agent(client: MockClient([]), systemPrompt: "s")),
+        ])
+        let out = await router.invoke(arguments: #"{"type":"x"}"#)
+        XCTAssertTrue(out.contains("Missing"))
+    }
+
     func testParentDelegatesToSubAgentInLoop() async throws {
         // Sub-agent answers directly.
         let subClient = MockClient([Completion(content: "delegated result")])
