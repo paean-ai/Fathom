@@ -22,6 +22,31 @@ public enum Series {
         return sd > 0 ? (target - Numbers.mean(xs)) / sd : nil
     }
 
+    /// z-score of every value (standardized series). nil on empty or zero spread.
+    public static func standardize(_ xs: [Double]) -> [Double]? {
+        guard !xs.isEmpty else { return nil }
+        let sd = Numbers.stdev(xs)
+        guard sd > 0 else { return nil }
+        let m = Numbers.mean(xs)
+        return xs.map { ($0 - m) / sd }
+    }
+
+    /// Sign-aware strength label for a correlation r (very strong/strong/moderate/weak/negligible
+    /// positive/negative, or "no linear relationship" near 0).
+    public static func describe(_ r: Double) -> String {
+        let a = abs(r)
+        guard a >= 0.05 else { return "no linear relationship" }
+        let strength: String
+        switch a {
+        case 0.9...:    strength = "very strong"
+        case 0.7..<0.9: strength = "strong"
+        case 0.5..<0.7: strength = "moderate"
+        case 0.3..<0.5: strength = "weak"
+        default:        strength = "negligible"
+        }
+        return "\(strength) \(r < 0 ? "negative" : "positive")"
+    }
+
     /// Simple moving average over a window (1…count); returns count−window+1 values, nil otherwise.
     public static func movingAverage(_ xs: [Double], window: Int) -> [Double]? {
         guard window >= 1, window <= xs.count else { return nil }
@@ -104,7 +129,7 @@ public struct CorrelationTool: OrchestratorTool {
         let x = Numbers.parse(a.string("x") ?? ""), y = Numbers.parse(a.string("y") ?? "")
         guard x.count == y.count else { return "x has \(x.count) numbers but y has \(y.count) — lists must be the same length." }
         guard let r = Series.correlation(x, y) else { return "Need ≥2 paired numbers and neither list flat." }
-        return "r = \(Numbers.fmt((r * 1000).rounded() / 1000)) (n=\(x.count))"
+        return "r = \(Numbers.fmt((r * 1000).rounded() / 1000)) (\(Series.describe(r)), n=\(x.count))"
     }
 }
 

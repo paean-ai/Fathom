@@ -39,6 +39,15 @@ final class SeriesToolsTests: XCTestCase {
         XCTAssertTrue(corr.contains("r = 1"))
     }
 
+    func testStandardizeAndDescribe() {
+        let zs = Series.standardize([10, 20, 30, 40])!
+        XCTAssertEqual(zs.reduce(0, +), 0, accuracy: 1e-9)   // zero-mean
+        XCTAssertNil(Series.standardize([5, 5, 5]))          // zero spread
+        XCTAssertTrue(Series.describe(0.95).contains("very strong"))
+        XCTAssertTrue(Series.describe(-0.8).contains("negative"))
+        XCTAssertEqual(Series.describe(0.0), "no linear relationship")
+    }
+
     func testBundleNames() {
         XCTAssertEqual(Set(SeriesTools.all().map(\.name)),
                        ["outliers", "z_score", "correlation", "moving_average", "running_total", "pct_change"])
