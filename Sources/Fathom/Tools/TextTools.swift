@@ -55,8 +55,10 @@ public struct TextTransformTool: OrchestratorTool {
 /// Base64 encode/decode.
 public enum Base64 {
     public static func encode(_ text: String) -> String { Data(text.utf8).base64EncodedString() }
+    /// Decode base64 to text. Tolerant of embedded whitespace/newlines; nil when the input isn't
+    /// valid base64 or the bytes aren't valid UTF-8.
     public static func decode(_ b64: String) -> String? {
-        guard let data = Data(base64Encoded: b64.trimmingCharacters(in: .whitespacesAndNewlines)) else { return nil }
+        guard let data = Data(base64Encoded: b64, options: .ignoreUnknownCharacters) else { return nil }
         return String(data: data, encoding: .utf8)
     }
 }

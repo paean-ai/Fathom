@@ -21,7 +21,10 @@ final class TextToolsTests: XCTestCase {
         let enc = Base64.encode("hello")
         XCTAssertEqual(enc, "aGVsbG8=")
         XCTAssertEqual(Base64.decode(enc), "hello")
-        XCTAssertNil(Base64.decode("!!!not base64!!!"))
+        XCTAssertNil(Base64.decode("!!!not base64!!!"))   // not decodable
+        XCTAssertNil(Base64.decode("////"))               // valid base64 but not UTF-8
+        let unicode = "café — naïve 🚀"                    // round-trips, embedded whitespace tolerated
+        XCTAssertEqual(Base64.decode(Base64.encode(unicode)), unicode)
     }
 
     func testToolsInvoke() async {
