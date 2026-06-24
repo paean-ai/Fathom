@@ -242,6 +242,11 @@ public struct GrepTool: OrchestratorTool {
 
 /// Run a shell command in the working directory and return its combined stdout+stderr. Mutating
 /// (so the approval gate can confirm) and time-bounded so a runaway command can't hang the agent.
+///
+/// When `confined` is set, the command runs under a conservative macOS `sandbox-exec` profile that
+/// DENIES network access and confines filesystem writes to the working directory (plus the system
+/// temp dirs and the standard `/dev` sinks) — so agent-written code can't phone home or clobber
+/// files outside its workspace. Reads stay open so interpreters/toolchains load normally.
 public struct RunCommandTool: OrchestratorTool {
     public let name = "run_command"
     public let toolDescription = "Run a shell command in the working directory and return its output. Use for builds, tests, git, etc."
@@ -251,16 +256,47 @@ public struct RunCommandTool: OrchestratorTool {
     ], "required": ["command"]] }
     let sandbox: FileSandbox
     let timeout: TimeInterval
-    public init(sandbox: FileSandbox, timeout: TimeInterval = 120) {
-        self.sandbox = sandbox; self.timeout = timeout
+    /// When true, wrap the command in `sandbox-exec` (no network; writes confined to the workdir).
+    let confined: Bool
+    public init(sandbox: FileSandbox, timeout: TimeInterval = 120, confined: Bool = false) {
+        self.sandbox = sandbox; self.timeout = timeout; self.confined = confined
+    }
+
+    /// A conservative `sandbox-exec` (SBPL) profile: allow everything by default EXCEPT network
+    /// access and filesystem writes outside `writableRoot` (system temp + the standard `/dev`
+    /// sinks stay writable so tools work). SBPL is last-match-wins, so the broad write-deny is
+    /// followed by the narrow allows. Pure → unit-testable.
+    public static func sandboxProfile(writableRoot: String) -> String {
+        func esc(_ s: String) -> String {
+            s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        }
+        let root = esc(writableRoot)
+        return """
+        (version 1)
+        (allow default)
+        (deny network*)
+        (deny file-write* (subpath "/"))
+        (allow file-write* (subpath "\(root)"))
+        (allow file-write* (subpath "/private/tmp"))
+        (allow file-write* (subpath "/private/var/tmp"))
+        (allow file-write* (subpath "/private/var/folders"))
+        (allow file-write* (literal "/dev/null") (literal "/dev/zero") (literal "/dev/stdout") (literal "/dev/stderr") (literal "/dev/dtracehelper") (regex #"^/dev/tty"))
+        """
     }
 
     public func invoke(arguments: String) async -> String {
         let a = JSONArgs(arguments)
         guard let command = a.string("command") else { return "Error: missing 'command'." }
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/sh")
-        proc.arguments = ["-c", command]
+        if confined {
+            // sandbox-exec confines writes to the workdir and denies network; the inner shell
+            // still runs with the workdir as its cwd.
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
+            proc.arguments = ["-p", Self.sandboxProfile(writableRoot: sandbox.root.path), "/bin/sh", "-c", command]
+        } else {
+            proc.executableURL = URL(fileURLWithPath: "/bin/sh")
+            proc.arguments = ["-c", command]
+        }
         proc.currentDirectoryURL = sandbox.root
         let pipe = Pipe()
         proc.standardOutput = pipe
@@ -299,9 +335,11 @@ struct JSONArgs {
 
 public extension FileSandbox {
     /// The full coding tool suite scoped to this sandbox — drop straight into `Orchestrator.run`.
-    func codingTools(commandTimeout: TimeInterval = 120) -> [OrchestratorTool] {
+    /// Set `sandboxed` to run shell commands under `sandbox-exec` (no network; writes confined to
+    /// this sandbox's root) — recommended whenever the agent runs model-written code.
+    func codingTools(commandTimeout: TimeInterval = 120, sandboxed: Bool = false) -> [OrchestratorTool] {
         [ReadFileTool(sandbox: self), WriteFileTool(sandbox: self), EditFileTool(sandbox: self),
          ListDirTool(sandbox: self), GlobTool(sandbox: self), GrepTool(sandbox: self),
-         RunCommandTool(sandbox: self, timeout: commandTimeout)]
+         RunCommandTool(sandbox: self, timeout: commandTimeout, confined: sandboxed)]
     }
 }

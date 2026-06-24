@@ -91,5 +91,36 @@ final class FileToolsTests: XCTestCase {
         let tools = try tempSandbox().codingTools()
         let names = Set(tools.map(\.name))
         XCTAssertEqual(names, ["read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "run_command"])
+        // The sandboxed bundle is the same toolset (only run_command's behavior differs).
+        XCTAssertEqual(Set(try tempSandbox().codingTools(sandboxed: true).map(\.name)), names)
+    }
+
+    // MARK: Sandboxed command execution
+
+    func testSandboxProfileDeniesNetworkAndConfinesWrites() {
+        let p = RunCommandTool.sandboxProfile(writableRoot: "/work space/dir")
+        XCTAssertTrue(p.contains("(deny network*)"), p)
+        XCTAssertTrue(p.contains(#"(deny file-write* (subpath "/"))"#), p)
+        XCTAssertTrue(p.contains(#"(allow file-write* (subpath "/work space/dir"))"#), p)   // spaces ok, escaped quotes
+    }
+
+    func testConfinedCommandAllowsWriteInsideWorkdir() async throws {
+        try XCTSkipUnless(FileManager.default.isExecutableFile(atPath: "/usr/bin/sandbox-exec"))
+        let box = try tempSandbox()
+        let out = await RunCommandTool(sandbox: box, confined: true)
+            .invoke(arguments: #"{"command":"echo inside > made.txt && cat made.txt"}"#)
+        XCTAssertTrue(out.contains("inside"), out)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: box.root.appendingPathComponent("made.txt").path))
+    }
+
+    func testConfinedCommandBlocksWriteOutsideWorkdir() async throws {
+        try XCTSkipUnless(FileManager.default.isExecutableFile(atPath: "/usr/bin/sandbox-exec"))
+        let box = try tempSandbox()
+        let target = "\(NSHomeDirectory())/.fathom-sandbox-escape-\(UUID().uuidString)"
+        let out = await RunCommandTool(sandbox: box, confined: true)
+            .invoke(arguments: #"{"command":"echo escaped > \#(target)"}"#)
+        // The write to $HOME (outside the workdir and not a temp dir) must be denied.
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target), "sandbox should have blocked the write; out=\(out)")
+        if FileManager.default.fileExists(atPath: target) { try? FileManager.default.removeItem(atPath: target) }
     }
 }
