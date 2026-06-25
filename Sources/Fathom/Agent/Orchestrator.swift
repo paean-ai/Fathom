@@ -40,6 +40,14 @@ public struct Orchestrator: Sendable {
     public var outputGuardrail: @Sendable (String) async -> GuardrailResult
     /// How many times the output guardrail may force a regeneration.
     public var maxGuardrailRetries: Int
+    /// Context shaping: cap the size (in characters) of OLDER tool-result messages before each model
+    /// call so a long tool-using run can't overflow the context window. 0 disables. A long run appends
+    /// every tool result to the transcript; without this, big outputs (file reads, command output)
+    /// accumulate unbounded. See `shapeContext`.
+    public var maxToolResultChars: Int
+    /// How many of the most-recent tool results to keep at full size (the model usually needs only the
+    /// latest outputs verbatim). Older ones beyond this are capped to `maxToolResultChars`.
+    public var keepRecentToolResultsFull: Int
 
     public init(client: LLMClient, maxRounds: Int = 8,
                 onStatus: @escaping @Sendable (String) -> Void = { _ in },
@@ -47,11 +55,14 @@ public struct Orchestrator: Sendable {
                 approval: @escaping @Sendable (ToolCall) async -> ToolApproval = { _ in .allow },
                 planning: Bool = false, critic: Bool = false, tokenBudget: Int? = nil,
                 outputGuardrail: @escaping @Sendable (String) async -> GuardrailResult = { _ in .pass },
-                maxGuardrailRetries: Int = 1) {
+                maxGuardrailRetries: Int = 1,
+                maxToolResultChars: Int = 8_000, keepRecentToolResultsFull: Int = 3) {
         self.client = client; self.maxRounds = maxRounds
         self.onStatus = onStatus; self.onObservation = onObservation; self.approval = approval
         self.planning = planning; self.critic = critic; self.tokenBudget = tokenBudget
         self.outputGuardrail = outputGuardrail; self.maxGuardrailRetries = maxGuardrailRetries
+        self.maxToolResultChars = maxToolResultChars
+        self.keepRecentToolResultsFull = keepRecentToolResultsFull
     }
 
     /// One tool call and its outcome, reported to `onObservation`.
@@ -105,7 +116,9 @@ public struct Orchestrator: Sendable {
             if Task.isCancelled { finish = .cancelled; break }
             if let budget = tokenBudget, usage.totalTokens >= budget { finish = .budget; break }
 
-            let completion = try await client.complete(messages: convo, tools: schemas)
+            let shaped = Self.shapeContext(convo, maxToolResultChars: maxToolResultChars,
+                                           keepRecentFull: keepRecentToolResultsFull)
+            let completion = try await client.complete(messages: shaped, tools: schemas)
             usage = usage + (completion.usage ?? Usage())
             guard completion.wantsTools else {
                 naturalAnswer = completion.content ?? ""
@@ -192,7 +205,9 @@ public struct Orchestrator: Sendable {
         } else if let naturalAnswer {
             answer = naturalAnswer
         } else {
-            let final = try await client.complete(messages: convo, tools: [])
+            let shaped = Self.shapeContext(convo, maxToolResultChars: maxToolResultChars,
+                                           keepRecentFull: keepRecentToolResultsFull)
+            let final = try await client.complete(messages: shaped, tools: [])
             usage = usage + (final.usage ?? Usage())
             answer = final.content ?? ""
         }
@@ -293,6 +308,29 @@ public struct Orchestrator: Sendable {
     }
 
     // MARK: pure helpers (loop safety rails)
+
+    /// Read-time context shaper: a long tool-using run appends every tool result to the transcript and
+    /// will eventually overflow the context window. Cap the size of OLDER tool-result messages (keeping
+    /// the `keepRecentFull` most recent results intact — the model usually needs only the latest outputs
+    /// verbatim) and mark the elision so the model knows content was dropped. Non-tool messages are
+    /// untouched; the caller's stored transcript is not mutated (this returns a projected copy). Pure.
+    public static func shapeContext(_ messages: [ChatMessage],
+                                    maxToolResultChars: Int,
+                                    keepRecentFull: Int) -> [ChatMessage] {
+        guard maxToolResultChars > 0 else { return messages }
+        let toolIdx = messages.indices.filter { messages[$0].role == .tool }
+        guard toolIdx.count > max(0, keepRecentFull) else { return messages }
+        let keep = Set(toolIdx.suffix(max(0, keepRecentFull)))
+        var out = messages
+        for i in toolIdx where !keep.contains(i) {
+            let c = out[i].content
+            if c.count > maxToolResultChars {
+                out[i].content = String(c.prefix(maxToolResultChars))
+                    + "\n…[truncated \(c.count - maxToolResultChars) chars of an earlier tool result]"
+            }
+        }
+        return out
+    }
 
     /// A stable signature so identical calls (even with reordered JSON keys) collapse.
     public static func callSignature(name: String, arguments: String) -> String {

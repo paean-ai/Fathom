@@ -115,4 +115,46 @@ final class OrchestratorTests: XCTestCase {
         XCTAssertNotNil(Orchestrator.finishNote(.noProgress))
         XCTAssertNotNil(Orchestrator.finishNote(.roundLimit))
     }
+
+    // MARK: context shaping (long-run overflow guard)
+
+    func testShapeContextCapsOlderToolResultsKeepsRecent() {
+        let big = String(repeating: "x", count: 5000)
+        let msgs = [
+            ChatMessage(role: .user, content: "q"),
+            ChatMessage(role: .tool, content: big, toolCallID: "1"),   // old → should cap
+            ChatMessage(role: .tool, content: big, toolCallID: "2"),   // recent → keep
+        ]
+        let out = Orchestrator.shapeContext(msgs, maxToolResultChars: 100, keepRecentFull: 1)
+        XCTAssertEqual(out[0].content, "q")                                   // non-tool untouched
+        XCTAssertTrue(out[1].content.count < 200, "old tool result capped")
+        XCTAssertTrue(out[1].content.contains("truncated"))
+        XCTAssertEqual(out[2].content, big, "most recent tool result kept full")
+    }
+
+    func testShapeContextDisabledAndUndersizedAreNoOps() {
+        let msgs = [ChatMessage(role: .tool, content: String(repeating: "y", count: 9000), toolCallID: "1")]
+        XCTAssertEqual(Orchestrator.shapeContext(msgs, maxToolResultChars: 0, keepRecentFull: 0), msgs)  // disabled
+        // Only 1 tool result and keepRecentFull 3 ⇒ nothing capped.
+        XCTAssertEqual(Orchestrator.shapeContext(msgs, maxToolResultChars: 100, keepRecentFull: 3), msgs)
+    }
+
+    func testLoopAppliesShapingToModelInput() async throws {
+        // Two rounds: a tool returns a huge result each round. With keepRecentFull 0 + small cap,
+        // the SECOND model call must receive a truncated copy of the FIRST round's tool result.
+        let huge = String(repeating: "z", count: 4000)
+        let client = MockClient([
+            Completion(content: nil, toolCalls: [ToolCall(id: "1", name: "s", arguments: #"{"n":1}"#)]),
+            Completion(content: nil, toolCalls: [ToolCall(id: "2", name: "s", arguments: #"{"n":2}"#)]),
+        ])
+        let orch = Orchestrator(client: client, maxRounds: 2,
+                                maxToolResultChars: 50, keepRecentToolResultsFull: 0)
+        _ = try await orch.run(systemPrompt: "s", query: "q", tools: [tool("s", returns: huge)])
+        // 2nd model call's messages: the first tool result (role .tool) must be truncated.
+        let secondCall = client.sentMessages[1]
+        let firstToolResult = secondCall.first { $0.role == .tool }
+        XCTAssertNotNil(firstToolResult)
+        XCTAssertTrue((firstToolResult?.content.count ?? 9999) < 200, "shaping should cap the old tool result sent to the model")
+        XCTAssertTrue(firstToolResult?.content.contains("truncated") ?? false)
+    }
 }
