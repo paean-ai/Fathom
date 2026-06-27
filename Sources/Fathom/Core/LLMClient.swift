@@ -7,7 +7,7 @@ public struct LLMConfig: Sendable {
     public var baseURL: URL
     public var temperature: Double
 
-    public init(apiKey: String, model: String = "deepseek-chat",
+    public init(apiKey: String, model: String = "deepseek-v4-flash",
                 baseURL: URL = URL(string: "https://api.deepseek.com/v1")!,
                 temperature: Double = 0.3) {
         self.apiKey = apiKey; self.model = model; self.baseURL = baseURL; self.temperature = temperature

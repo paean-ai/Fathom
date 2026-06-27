@@ -63,7 +63,7 @@ public struct Completion: Sendable, Equatable {
     public let toolCalls: [ToolCall]
     public let usage: Usage?
     /// DeepSeek-native: the `reasoning_content` chain-of-thought emitted by reasoning models
-    /// (e.g. deepseek-reasoner) alongside the answer. nil for models that don't produce it.
+    /// (e.g. deepseek-v4-pro) alongside the answer. nil for models that don't produce it.
     public let reasoningContent: String?
     public init(content: String?, toolCalls: [ToolCall] = [], usage: Usage? = nil,
                 reasoningContent: String? = nil) {
