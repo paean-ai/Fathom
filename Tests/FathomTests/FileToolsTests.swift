@@ -45,6 +45,8 @@ final class FileToolsTests: XCTestCase {
 
         let edit = await EditFileTool(sandbox: box).invoke(arguments: #"{"path":"a/hello.txt","old_string":"world","new_string":"Fathom"}"#)
         XCTAssertTrue(edit.contains("Edited"))
+        XCTAssertTrue(edit.contains("at line 1"), "confirms where the edit landed")
+        XCTAssertTrue(edit.contains("Fathom"), "shows the revised content")
         let read2 = await ReadFileTool(sandbox: box).invoke(arguments: #"{"path":"a/hello.txt"}"#)
         XCTAssertEqual(read2, "hello Fathom")
     }

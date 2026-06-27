@@ -140,8 +140,14 @@ public struct EditFileTool: OrchestratorTool {
             return "Error: 'old_string' appears \(parts.count - 1) times in \(path) — add context to make it unique."
         }
         let updated = parts[0] + new + parts[1]
-        do { try updated.write(to: url, atomically: true, encoding: .utf8)
-             return "Edited \(path)." }
+        do {
+            try updated.write(to: url, atomically: true, encoding: .utf8)
+            // Confirm the revised region (SWE-agent ACI: show state after an edit) so the agent can
+            // verify the change landed where intended without re-reading the whole file.
+            let line = parts[0].reduce(into: 1) { n, c in if c == "\n" { n += 1 } }
+            let preview = new.count > 400 ? String(new.prefix(400)) + "…" : new
+            return "Edited \(path) at line \(line):\n\(preview)"
+        }
         catch { return "Error writing \(path): \(error.localizedDescription)" }
     }
 }
