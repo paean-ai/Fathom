@@ -96,12 +96,14 @@ public struct RunResult: Sendable {
     public let usage: Usage
     /// How many times an output guardrail forced a regeneration.
     public let guardrailRetries: Int
+    /// How many times the transcript was compacted IN-RUN to stay within the context window.
+    public let compactions: Int
     public init(answer: String, messages: [ChatMessage], toolCallCount: Int,
                 finish: FinishReason, plan: [String] = [], revised: Bool = false,
-                usage: Usage = Usage(), guardrailRetries: Int = 0) {
+                usage: Usage = Usage(), guardrailRetries: Int = 0, compactions: Int = 0) {
         self.answer = answer; self.messages = messages; self.toolCallCount = toolCallCount
         self.finish = finish; self.plan = plan; self.revised = revised; self.usage = usage
-        self.guardrailRetries = guardrailRetries
+        self.guardrailRetries = guardrailRetries; self.compactions = compactions
     }
 }
 

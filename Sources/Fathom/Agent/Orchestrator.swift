@@ -48,6 +48,16 @@ public struct Orchestrator: Sendable {
     /// How many of the most-recent tool results to keep at full size (the model usually needs only the
     /// latest outputs verbatim). Older ones beyond this are capped to `maxToolResultChars`.
     public var keepRecentToolResultsFull: Int
+    /// IN-RUN auto-compaction: when the live prompt exceeds this many tokens (actual usage reported
+    /// by the client, falling back to a ≈4-chars/token estimate), the MIDDLE of the transcript is
+    /// summarized by the model into one recap message and the loop continues — so a single long run
+    /// survives past the context window, not just truncated tool results (`maxToolResultChars`) or
+    /// between-turn compaction (`Thread`). The system prompt, the first user message (the goal) and
+    /// the recent tail stay verbatim. 0 disables (the default). Streaming mode does not compact.
+    public var compactionThresholdTokens: Int
+    /// How many trailing messages stay verbatim when an in-run compaction fires (extended backward
+    /// if needed so the tail never starts with an orphaned tool result).
+    public var keepRecentOnCompaction: Int
 
     public init(client: LLMClient, maxRounds: Int = 8,
                 onStatus: @escaping @Sendable (String) -> Void = { _ in },
@@ -56,13 +66,16 @@ public struct Orchestrator: Sendable {
                 planning: Bool = false, critic: Bool = false, tokenBudget: Int? = nil,
                 outputGuardrail: @escaping @Sendable (String) async -> GuardrailResult = { _ in .pass },
                 maxGuardrailRetries: Int = 1,
-                maxToolResultChars: Int = 8_000, keepRecentToolResultsFull: Int = 3) {
+                maxToolResultChars: Int = 8_000, keepRecentToolResultsFull: Int = 3,
+                compactionThresholdTokens: Int = 0, keepRecentOnCompaction: Int = 8) {
         self.client = client; self.maxRounds = maxRounds
         self.onStatus = onStatus; self.onObservation = onObservation; self.approval = approval
         self.planning = planning; self.critic = critic; self.tokenBudget = tokenBudget
         self.outputGuardrail = outputGuardrail; self.maxGuardrailRetries = maxGuardrailRetries
         self.maxToolResultChars = maxToolResultChars
         self.keepRecentToolResultsFull = keepRecentToolResultsFull
+        self.compactionThresholdTokens = compactionThresholdTokens
+        self.keepRecentOnCompaction = keepRecentOnCompaction
     }
 
     /// One tool call and its outcome, reported to `onObservation`.
@@ -110,16 +123,29 @@ public struct Orchestrator: Sendable {
         var stalls = 0
         var finish: FinishReason = .roundLimit
         var naturalAnswer: String?   // set when the model answers in-loop (no tools)
+        var compactions = 0
+        var lastPromptTokens = 0     // actual prompt size the client last reported
 
         for _ in 0..<maxRounds {
             // Stop gracefully on cancellation or when the token budget is reached.
             if Task.isCancelled { finish = .cancelled; break }
             if let budget = tokenBudget, usage.totalTokens >= budget { finish = .budget; break }
 
+            // COMPACT when the transcript has outgrown the threshold (prefer the size the
+            // client actually reported; the char estimate covers the tool results appended
+            // since then, and clients that don't report usage at all).
+            if compactionThresholdTokens > 0,
+               max(lastPromptTokens, Self.estimateTokens(convo)) >= compactionThresholdTokens,
+               await compactInRun(&convo, usage: &usage) {
+                compactions += 1
+                lastPromptTokens = 0   // stale — the transcript just shrank
+            }
+
             let shaped = Self.shapeContext(convo, maxToolResultChars: maxToolResultChars,
                                            keepRecentFull: keepRecentToolResultsFull)
             let completion = try await client.complete(messages: shaped, tools: schemas)
             usage = usage + (completion.usage ?? Usage())
+            lastPromptTokens = completion.usage?.promptTokens ?? lastPromptTokens
             guard completion.wantsTools else {
                 naturalAnswer = completion.content ?? ""
                 finish = .natural
@@ -205,6 +231,12 @@ public struct Orchestrator: Sendable {
         } else if let naturalAnswer {
             answer = naturalAnswer
         } else {
+            // The close-out call must fit the window too.
+            if compactionThresholdTokens > 0,
+               max(lastPromptTokens, Self.estimateTokens(convo)) >= compactionThresholdTokens,
+               await compactInRun(&convo, usage: &usage) {
+                compactions += 1
+            }
             let shaped = Self.shapeContext(convo, maxToolResultChars: maxToolResultChars,
                                            keepRecentFull: keepRecentToolResultsFull)
             let final = try await client.complete(messages: shaped, tools: [])
@@ -248,7 +280,32 @@ public struct Orchestrator: Sendable {
 
         return RunResult(answer: answer, messages: convo, toolCallCount: calls,
                          finish: finish, plan: plan, revised: revised, usage: usage,
-                         guardrailRetries: guardrailRetries)
+                         guardrailRetries: guardrailRetries, compactions: compactions)
+    }
+
+    // MARK: in-run compaction
+
+    /// Summarize the middle of the transcript into one recap message, in place. FAILURE-SAFE:
+    /// on any shortfall (nothing worth summarizing, the model call throws, an empty summary)
+    /// the transcript is left untouched and the run simply continues — compaction must never
+    /// kill a run it exists to save. Returns whether a compaction was applied.
+    private func compactInRun(_ convo: inout [ChatMessage], usage: inout Usage) async -> Bool {
+        let split = Self.compactionSplit(convo, keepRecent: keepRecentOnCompaction)
+        guard !split.middle.isEmpty else { return false }
+        onStatus("Compacting context…")
+        let msgs = [
+            ChatMessage(role: .system, content: "You compress an agent's working transcript mid-task. Summarize the steps below into a compact brief that preserves: the goal and constraints, what was tried, key facts/paths/numbers from tool results, what succeeded or failed, and what remains to be done. Output ONLY the brief."),
+            ChatMessage(role: .user, content: Self.renderForSummary(split.middle)),
+        ]
+        guard let c = try? await client.complete(messages: msgs, tools: []) else { return false }
+        usage = usage + (c.usage ?? Usage())
+        let summary = (c.content ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !summary.isEmpty else { return false }
+        convo = split.head
+            + [ChatMessage(role: .system,
+                content: "CONTEXT RECAP — earlier steps were compacted to stay within the context window:\n\(summary)")]
+            + split.tail
+        return true
     }
 
     // MARK: plan & verify phases
@@ -330,6 +387,44 @@ public struct Orchestrator: Sendable {
             }
         }
         return out
+    }
+
+    /// Split for in-run compaction. `head` = the leading system message(s) plus the first user
+    /// message right after them (the goal, kept verbatim). `tail` = the `keepRecent` most recent
+    /// messages, extended backward if needed so it never STARTS with a `.tool` message (a tool
+    /// result must follow the assistant turn that called it, or the API rejects the transcript).
+    /// `middle` = everything between — what gets summarized. Pure → testable.
+    public static func compactionSplit(_ messages: [ChatMessage], keepRecent: Int)
+        -> (head: [ChatMessage], middle: [ChatMessage], tail: [ChatMessage]) {
+        var headEnd = 0
+        while headEnd < messages.count, messages[headEnd].role == .system { headEnd += 1 }
+        if headEnd < messages.count, messages[headEnd].role == .user { headEnd += 1 }
+        var tailStart = max(headEnd, messages.count - max(0, keepRecent))
+        while tailStart > headEnd, tailStart < messages.count, messages[tailStart].role == .tool {
+            tailStart -= 1
+        }
+        return (Array(messages[..<headEnd]),
+                Array(messages[headEnd..<tailStart]),
+                Array(messages[tailStart...]))
+    }
+
+    /// Crude prompt-size estimate (≈4 chars per token, plus per-message overhead) for when the
+    /// client hasn't reported real usage. Counts tool-call arguments too. Pure.
+    public static func estimateTokens(_ messages: [ChatMessage]) -> Int {
+        messages.reduce(0) { total, m in
+            let argChars = m.toolCalls.reduce(0) { $0 + $1.name.count + $1.arguments.count }
+            return total + (m.content.count + argChars) / 4 + 8
+        }
+    }
+
+    /// Render messages as a plain transcript for the compaction summarizer, capping each
+    /// message so a pathological tool result can't overflow the summarizer's own window. Pure.
+    static func renderForSummary(_ messages: [ChatMessage], perMessageCap: Int = 6_000) -> String {
+        messages.map { m in
+            var line = "\(m.role.rawValue): \(String(m.content.prefix(perMessageCap)))"
+            for c in m.toolCalls { line += "\n  → called \(c.name)(\(String(c.arguments.prefix(500))))" }
+            return line
+        }.joined(separator: "\n")
     }
 
     /// A stable signature so identical calls (even with reordered JSON keys) collapse.
