@@ -53,7 +53,7 @@ public struct Orchestrator: Sendable {
     /// summarized by the model into one recap message and the loop continues — so a single long run
     /// survives past the context window, not just truncated tool results (`maxToolResultChars`) or
     /// between-turn compaction (`Thread`). The system prompt, the first user message (the goal) and
-    /// the recent tail stay verbatim. 0 disables (the default). Streaming mode does not compact.
+    /// the recent tail stay verbatim. 0 disables (the default). Applies to streaming runs too.
     public var compactionThresholdTokens: Int
     /// How many trailing messages stay verbatim when an in-run compaction fires (extended backward
     /// if needed so the tail never starts with an orphaned tool result).
@@ -288,8 +288,9 @@ public struct Orchestrator: Sendable {
     /// Summarize the middle of the transcript into one recap message, in place. FAILURE-SAFE:
     /// on any shortfall (nothing worth summarizing, the model call throws, an empty summary)
     /// the transcript is left untouched and the run simply continues — compaction must never
-    /// kill a run it exists to save. Returns whether a compaction was applied.
-    private func compactInRun(_ convo: inout [ChatMessage], usage: inout Usage) async -> Bool {
+    /// kill a run it exists to save. Returns whether a compaction was applied. (Internal so
+    /// the streaming loop in Streaming.swift shares it.)
+    func compactInRun(_ convo: inout [ChatMessage], usage: inout Usage) async -> Bool {
         let split = Self.compactionSplit(convo, keepRecent: keepRecentOnCompaction)
         guard !split.middle.isEmpty else { return false }
         onStatus("Compacting context…")

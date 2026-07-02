@@ -26,8 +26,8 @@ public extension Orchestrator {
     /// `.answerDelta` chunks; tool runs surface as `.status`/`.toolResult`; the stream ends
     /// with `.finished(RunResult)`. If the client isn't a `StreamingLLMClient`, it falls
     /// back to a one-shot run and yields the whole answer once. (Streaming mode applies the
-    /// de-dup / no-progress / round-limit / cancellation rails; planning, critic and
-    /// guardrails remain on the non-streaming `run`.)
+    /// de-dup / no-progress / round-limit / cancellation rails and in-run compaction; planning,
+    /// critic and guardrails remain on the non-streaming `run`.)
     func runStreaming(systemPrompt: String, query: String,
                       history: [ChatMessage] = [], tools: [OrchestratorTool]) -> AsyncThrowingStream<AgentEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -53,9 +53,22 @@ public extension Orchestrator {
                     var finish: FinishReason = .roundLimit
                     var usage = Usage()
                     var answer = ""
+                    var compactions = 0
+                    var lastPromptTokens = 0
 
                     rounds: for _ in 0..<maxRounds {
                         if Task.isCancelled { finish = .cancelled; break }
+
+                        // Same in-run compaction as the non-streaming loop: past the threshold,
+                        // summarize the transcript middle and keep going.
+                        if compactionThresholdTokens > 0,
+                           max(lastPromptTokens, Self.estimateTokens(convo)) >= compactionThresholdTokens {
+                            continuation.yield(.status("Compacting context…"))
+                            if await compactInRun(&convo, usage: &usage) {
+                                compactions += 1
+                                lastPromptTokens = 0
+                            }
+                        }
 
                         var content = "", toolCalls: [ToolCall] = []
                         for try await delta in sc.stream(messages: convo, tools: schemas) {
@@ -64,7 +77,7 @@ public extension Orchestrator {
                                 content += t
                                 continuation.yield(.answerDelta(t))   // answer turns carry text; tool turns don't
                             case .toolCall(let c): toolCalls.append(c)
-                            case .usage(let u): usage = usage + u
+                            case .usage(let u): usage = usage + u; lastPromptTokens = u.promptTokens
                             }
                         }
 
@@ -96,8 +109,14 @@ public extension Orchestrator {
                         } else { stalls = 0 }
                     }
 
-                    // If the loop ended without a natural answer, stream a closing answer.
+                    // If the loop ended without a natural answer, stream a closing answer
+                    // (compacted first if the transcript has outgrown the window).
                     if answer.isEmpty && finish != .cancelled {
+                        if compactionThresholdTokens > 0,
+                           max(lastPromptTokens, Self.estimateTokens(convo)) >= compactionThresholdTokens,
+                           await compactInRun(&convo, usage: &usage) {
+                            compactions += 1
+                        }
                         for try await delta in sc.stream(messages: convo, tools: []) {
                             switch delta {
                             case .text(let t): answer += t; continuation.yield(.answerDelta(t))
@@ -108,7 +127,7 @@ public extension Orchestrator {
                     }
 
                     let result = RunResult(answer: answer, messages: convo, toolCallCount: calls,
-                                           finish: finish, usage: usage)
+                                           finish: finish, usage: usage, compactions: compactions)
                     continuation.yield(.finished(result))
                     continuation.finish()
                 } catch {

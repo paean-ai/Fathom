@@ -5,7 +5,13 @@ import XCTest
 /// `stream()` call, consumed in order. Also satisfies `complete` for the fallback path.
 final class MockStreamingClient: StreamingLLMClient, @unchecked Sendable {
     private var streams: [[StreamDelta]]
-    init(_ streams: [[StreamDelta]]) { self.streams = streams }
+    /// Scripted replies for non-streaming `complete` calls (the compaction summarizer uses
+    /// them mid-stream); records what each was sent.
+    private var completions: [Completion]
+    private(set) var completeMessages: [[ChatMessage]] = []
+    init(_ streams: [[StreamDelta]], completions: [Completion] = []) {
+        self.streams = streams; self.completions = completions
+    }
 
     func stream(messages: [ChatMessage], tools: [[String: Any]]) -> AsyncThrowingStream<StreamDelta, Error> {
         let deltas = streams.isEmpty ? [.text("done")] : streams.removeFirst()
@@ -15,7 +21,8 @@ final class MockStreamingClient: StreamingLLMClient, @unchecked Sendable {
         }
     }
     func complete(messages: [ChatMessage], tools: [[String: Any]]) async throws -> Completion {
-        Completion(content: "non-streaming fallback")
+        completeMessages.append(messages)
+        return completions.isEmpty ? Completion(content: "non-streaming fallback") : completions.removeFirst()
     }
 }
 
@@ -76,5 +83,35 @@ final class StreamingTests: XCTestCase {
         let (deltas, result) = try await collect(agent.stream("hi"))
         XCTAssertEqual(deltas, ["one-shot answer"], "non-streaming client yields the whole answer once")
         XCTAssertEqual(result?.answer, "one-shot answer")
+    }
+
+    func testStreamingRunCompactsPastThreshold() async throws {
+        // Round 1 reports a prompt over the threshold → round 2 opens by compacting
+        // (a non-streaming summarize call), then the streamed answer completes as usual.
+        let client = MockStreamingClient([
+            [.toolCall(ToolCall(id: "1", name: "probe", arguments: "{}")),
+             .usage(Usage(prompt: 150_000, completion: 5))],
+            [.text("after "), .text("compaction")],
+        ], completions: [Completion(content: "THE-BRIEF")])
+        var history: [ChatMessage] = []
+        for i in 0..<8 {
+            history.append(ChatMessage(role: .user, content: "old q\(i)"))
+            history.append(ChatMessage(role: .assistant, content: "old a\(i)"))
+        }
+        var orch = Orchestrator(client: client, compactionThresholdTokens: 100_000,
+                                keepRecentOnCompaction: 2)
+        orch.maxToolResultChars = 0
+        let probe = ClosureTool(name: "probe", description: "p") { _ in "DATA" }
+        var result: RunResult?
+        for try await ev in orch.runStreaming(systemPrompt: "sys", query: "goal",
+                                              history: history, tools: [probe]) {
+            if case .finished(let r) = ev { result = r }
+        }
+        XCTAssertEqual(result?.answer, "after compaction")
+        XCTAssertEqual(result?.compactions, 1)
+        XCTAssertTrue(result?.messages.contains { $0.content.contains("CONTEXT RECAP") && $0.content.contains("THE-BRIEF") } == true)
+        XCTAssertFalse(result?.messages.contains { $0.content == "old q3" } == true)
+        // The summarizer (a complete call) saw the old turns.
+        XCTAssertTrue(client.completeMessages.first?.last?.content.contains("old q3") == true)
     }
 }
