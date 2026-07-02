@@ -152,7 +152,8 @@ public struct Orchestrator: Sendable {
                 break
             }
             convo.append(ChatMessage(role: .assistant, content: completion.content ?? "",
-                                     toolCalls: completion.toolCalls))
+                                     toolCalls: completion.toolCalls,
+                                     reasoningContent: completion.reasoningContent))
 
             // 1) CLASSIFY each call: a repeat (de-duped), a denied mutation, or runnable.
             //    Approval is awaited here, sequentially, so a human prompt stays orderly.
@@ -414,7 +415,8 @@ public struct Orchestrator: Sendable {
     public static func estimateTokens(_ messages: [ChatMessage]) -> Int {
         messages.reduce(0) { total, m in
             let argChars = m.toolCalls.reduce(0) { $0 + $1.name.count + $1.arguments.count }
-            return total + (m.content.count + argChars) / 4 + 8
+            let reasoningChars = m.reasoningContent?.count ?? 0
+            return total + (m.content.count + argChars + reasoningChars) / 4 + 8
         }
     }
 

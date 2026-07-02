@@ -3,6 +3,7 @@ import Foundation
 /// One incremental piece of a streamed model response.
 public enum StreamDelta: Sendable, Equatable {
     case text(String)        // a chunk of answer text
+    case reasoning(String)   // a chunk of thinking-mode chain of thought (reasoning_content)
     case toolCall(ToolCall)  // a fully-assembled tool call (the client reassembles fragments)
     case usage(Usage)        // final token usage, when the API reports it
 }
@@ -18,6 +19,7 @@ public enum AgentEvent: Sendable {
     case status(String)                       // e.g. "Running search…"
     case toolResult(name: String, result: String)
     case answerDelta(String)                  // a chunk of the final answer
+    case reasoningDelta(String)               // a chunk of thinking-mode reasoning (for "thinking…" UI)
     case finished(RunResult)                  // terminal event with the full result
 }
 
@@ -70,12 +72,15 @@ public extension Orchestrator {
                             }
                         }
 
-                        var content = "", toolCalls: [ToolCall] = []
+                        var content = "", reasoning = "", toolCalls: [ToolCall] = []
                         for try await delta in sc.stream(messages: convo, tools: schemas) {
                             switch delta {
                             case .text(let t):
                                 content += t
                                 continuation.yield(.answerDelta(t))   // answer turns carry text; tool turns don't
+                            case .reasoning(let t):
+                                reasoning += t
+                                continuation.yield(.reasoningDelta(t))
                             case .toolCall(let c): toolCalls.append(c)
                             case .usage(let u): usage = usage + u; lastPromptTokens = u.promptTokens
                             }
@@ -83,7 +88,8 @@ public extension Orchestrator {
 
                         if toolCalls.isEmpty { answer = content; finish = .natural; break }
 
-                        convo.append(ChatMessage(role: .assistant, content: content, toolCalls: toolCalls))
+                        convo.append(ChatMessage(role: .assistant, content: content, toolCalls: toolCalls,
+                                                 reasoningContent: reasoning.isEmpty ? nil : reasoning))
                         var fresh = 0
                         for call in toolCalls {
                             let sig = Self.callSignature(name: call.name, arguments: call.arguments)
@@ -120,6 +126,7 @@ public extension Orchestrator {
                         for try await delta in sc.stream(messages: convo, tools: []) {
                             switch delta {
                             case .text(let t): answer += t; continuation.yield(.answerDelta(t))
+                            case .reasoning(let t): continuation.yield(.reasoningDelta(t))
                             case .usage(let u): usage = usage + u
                             case .toolCall: break
                             }
@@ -154,12 +161,7 @@ extension DeepSeekClient: StreamingLLMClient {
         // (a URLRequest), not the non-Sendable `[[String: Any]]` tool schemas or `self`.
         let request: URLRequest
         do {
-            var body: [String: Any] = [
-                "model": config.model, "temperature": config.temperature, "stream": true,
-                "stream_options": ["include_usage": true],
-                "messages": messages.map(Self.wire),
-            ]
-            if !tools.isEmpty { body["tools"] = tools; body["tool_choice"] = "auto" }
+            let body = requestBody(messages: messages, tools: tools, stream: true)
             var req = URLRequest(url: config.baseURL.appendingPathComponent("chat/completions"))
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -185,6 +187,7 @@ extension DeepSeekClient: StreamingLLMClient {
                             continuation.yield(.usage(Usage(prompt: u.promptTokens ?? 0, completion: u.completionTokens ?? 0, total: u.totalTokens)))
                         }
                         guard let delta = chunk.choices.first?.delta else { continue }
+                        if let r = delta.reasoningContent, !r.isEmpty { continuation.yield(.reasoning(r)) }
                         if let c = delta.content, !c.isEmpty { continuation.yield(.text(c)) }
                         for frag in delta.toolCalls ?? [] {
                             var acc = toolAccum[frag.index] ?? (id: "", name: "", args: "")
@@ -210,8 +213,11 @@ extension DeepSeekClient: StreamingLLMClient {
         struct Choice: Decodable { let delta: Delta }
         struct Delta: Decodable {
             let content: String?
+            let reasoningContent: String?
             let toolCalls: [ToolFrag]?
-            enum CodingKeys: String, CodingKey { case content, toolCalls = "tool_calls" }
+            enum CodingKeys: String, CodingKey {
+                case content, toolCalls = "tool_calls", reasoningContent = "reasoning_content"
+            }
         }
         struct ToolFrag: Decodable {
             let index: Int; let id: String?; let function: Fn?

@@ -6,11 +6,20 @@ public struct LLMConfig: Sendable {
     public var model: String
     public var baseURL: URL
     public var temperature: Double
+    /// THINKING MODE (deepseek-v4): the model reasons before answering — including between tool
+    /// calls — and returns the chain of thought as `reasoning_content`. Off by default. When on,
+    /// the API REQUIRES tool-call assistant turns to carry their `reasoning_content` back in every
+    /// subsequent request (else 400) — `DeepSeekClient.wire` and the `Orchestrator` handle that.
+    public var thinking: Bool
+    /// Reasoning effort for thinking mode ("high" / "max"); nil sends no preference.
+    public var reasoningEffort: String?
 
     public init(apiKey: String, model: String = "deepseek-v4-flash",
                 baseURL: URL = URL(string: "https://api.deepseek.com/v1")!,
-                temperature: Double = 0.3) {
+                temperature: Double = 0.3,
+                thinking: Bool = false, reasoningEffort: String? = nil) {
         self.apiKey = apiKey; self.model = model; self.baseURL = baseURL; self.temperature = temperature
+        self.thinking = thinking; self.reasoningEffort = reasoningEffort
     }
 }
 
@@ -30,12 +39,7 @@ public struct DeepSeekClient: LLMClient {
     }
 
     public func complete(messages: [ChatMessage], tools: [[String: Any]]) async throws -> Completion {
-        var body: [String: Any] = [
-            "model": config.model,
-            "temperature": config.temperature,
-            "messages": messages.map(Self.wire),
-        ]
-        if !tools.isEmpty { body["tools"] = tools; body["tool_choice"] = "auto" }
+        let body = requestBody(messages: messages, tools: tools)
 
         var req = URLRequest(url: config.baseURL.appendingPathComponent("chat/completions"))
         req.httpMethod = "POST"
@@ -62,6 +66,21 @@ public struct DeepSeekClient: LLMClient {
         return Completion(content: msg?.content, toolCalls: calls, usage: usage, reasoningContent: reasoning)
     }
 
+    /// The chat-completions request body — one place for the wire contract, shared by
+    /// `complete` and the streaming path. Internal → unit-testable.
+    func requestBody(messages: [ChatMessage], tools: [[String: Any]], stream: Bool = false) -> [String: Any] {
+        var body: [String: Any] = [
+            "model": config.model,
+            "temperature": config.temperature,
+            "messages": messages.map(Self.wire),
+        ]
+        if !tools.isEmpty { body["tools"] = tools; body["tool_choice"] = "auto" }
+        if config.thinking { body["thinking"] = ["type": "enabled"] }
+        if let effort = config.reasoningEffort { body["reasoning_effort"] = effort }
+        if stream { body["stream"] = true; body["stream_options"] = ["include_usage": true] }
+        return body
+    }
+
     /// Convert a ChatMessage to the wire JSON the API expects.
     public static func wire(_ m: ChatMessage) -> [String: Any] {
         var d: [String: Any] = ["role": m.role.rawValue, "content": m.content]
@@ -69,6 +88,10 @@ public struct DeepSeekClient: LLMClient {
             d["tool_calls"] = m.toolCalls.map {
                 ["id": $0.id, "type": "function", "function": ["name": $0.name, "arguments": $0.arguments]]
             }
+            // Thinking mode: a tool-call turn must return its chain of thought to the API in
+            // every subsequent request, or the API rejects the transcript with a 400. Non-tool
+            // turns deliberately don't send it (the API ignores it at best).
+            if let rc = m.reasoningContent, !rc.isEmpty { d["reasoning_content"] = rc }
         }
         if let tcid = m.toolCallID { d["tool_call_id"] = tcid }
         return d

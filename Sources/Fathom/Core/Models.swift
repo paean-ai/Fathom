@@ -13,9 +13,15 @@ public struct ChatMessage: Sendable, Equatable {
     public var toolCalls: [ToolCall]
     /// For tool-result turns — which call this answers.
     public var toolCallID: String?
+    /// Thinking mode: the chain of thought a tool-calling assistant turn produced. Carried on
+    /// the message because the API requires it back verbatim on subsequent requests (see
+    /// `LLMConfig.thinking`); nil outside thinking mode.
+    public var reasoningContent: String?
 
-    public init(role: Role, content: String = "", toolCalls: [ToolCall] = [], toolCallID: String? = nil) {
+    public init(role: Role, content: String = "", toolCalls: [ToolCall] = [], toolCallID: String? = nil,
+                reasoningContent: String? = nil) {
         self.role = role; self.content = content; self.toolCalls = toolCalls; self.toolCallID = toolCallID
+        self.reasoningContent = reasoningContent
     }
 }
 

@@ -66,6 +66,7 @@ final class StreamingTests: XCTestCase {
             case .status(let s): statuses.append(s)
             case .toolResult(_, let r): toolResults.append(r)
             case .answerDelta(let t): deltas.append(t)
+            case .reasoningDelta: break
             case .finished(let r): result = r
             }
         }
